@@ -9,6 +9,7 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+pub mod java_dependencies;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
@@ -3963,6 +3964,8 @@ impl Project {
                     _ => (),
                 }
             }
+            // The dependency view subscribes directly to its owning LSP store.
+            LspStoreEvent::JavaDependenciesChanged { .. } => {}
             LspStoreEvent::Notification(message) => cx.emit(Event::Toast {
                 notification_id: "lsp".into(),
                 message: message.clone(),
@@ -3980,6 +3983,7 @@ impl Project {
             LspStoreEvent::WorkspaceEditApplied(transaction) => {
                 cx.emit(Event::WorkspaceEditApplied(transaction.clone()))
             }
+            LspStoreEvent::JavaDependencyDocumentOpened { .. } => {}
         }
     }
 

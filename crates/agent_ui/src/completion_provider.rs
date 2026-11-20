@@ -2398,7 +2398,7 @@ pub(crate) fn search_symbols(
             &query,
             false,
             true,
-            MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
+            MAX_MATCHES,
             &cancellation_flag,
             cx.background_executor().clone(),
         ));
@@ -2411,6 +2411,10 @@ pub(crate) fn search_symbols(
         external_matches.sort_unstable_by_key(sort_key_for_match);
         let mut matches = visible_matches;
         matches.append(&mut external_matches);
+        // Rank before truncating so weak workspace matches cannot hide dependency symbols.
+        // Stable sorting keeps workspace symbols first when scores are equal.
+        matches.sort_by_key(|matched| Reverse(OrderedFloat(matched.score)));
+        matches.truncate(MAX_MATCHES);
 
         matches
             .into_iter()

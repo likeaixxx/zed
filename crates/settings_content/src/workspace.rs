@@ -823,6 +823,11 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
+    /// Whether to show the collapsible Java External Libraries section.
+    /// Dependencies load when the section is expanded.
+    ///
+    /// Default: false
+    pub show_external_libraries: Option<bool>,
     /// Whether to hide gitignore files in the project panel.
     ///
     /// Default: false

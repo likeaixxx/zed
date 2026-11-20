@@ -873,6 +873,7 @@ impl VsCodeSettings {
                     horizontal_scroll: Some(horizontal_scrolling),
                 },
             ),
+            show_external_libraries: None,
             show_diagnostics: self
                 .read_bool("problems.decorations.enabled")
                 .and_then(|b| if b { Some(ShowDiagnostics::Off) } else { None }),

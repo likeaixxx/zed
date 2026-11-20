@@ -704,6 +704,9 @@ impl Item for Editor {
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        if let Some(path) = self.dependency_display_path() {
+            return Some(path.clone());
+        }
         let multi_buffer = self.buffer().read(cx);
         if let Some(file) = multi_buffer
             .as_singleton()

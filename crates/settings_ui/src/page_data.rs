@@ -5508,9 +5508,32 @@ fn window_and_layout_page() -> SettingsPage {
 }
 
 fn panels_page() -> SettingsPage {
-    fn project_panel_section() -> [SettingsPageItem; 30] {
+    fn project_panel_section() -> [SettingsPageItem; 31] {
         [
             SettingsPageItem::SectionHeader("Project Panel"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show External Libraries",
+                description: "Show Java dependencies in a collapsible section. Expand it to load modules, JARs, packages, and classes.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.show_external_libraries"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .show_external_libraries
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .show_external_libraries = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Project Panel Dock",
                 description: "Where to dock the project panel.",

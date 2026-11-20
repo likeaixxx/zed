@@ -1188,6 +1188,8 @@ pub struct Editor {
     in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
+    /// Absolute library path for Java dependency documents opened from JDTLS caches.
+    dependency_display_path: Option<SharedString>,
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: TypeIdHashMap<Box<dyn Addon>>,
@@ -2377,6 +2379,10 @@ impl Editor {
             code_action_providers.push(Rc::new(project) as Rc<_>);
         }
 
+        let dependency_display = dependency_display_path_for_buffer(&multi_buffer, cx);
+        let breadcrumb_header = dependency_display.as_ref().map(|path| path.compact.clone());
+        let dependency_display_path = dependency_display.map(|path| SharedString::from(path.full));
+
         let mut editor = Self {
             focus_handle,
             show_cursor_when_unfocused: false,
@@ -2579,7 +2585,8 @@ impl Editor {
             linked_edit_ranges: Default::default(),
             in_project_search: false,
             previous_search_ranges: None,
-            breadcrumb_header: None,
+            breadcrumb_header,
+            dependency_display_path,
             focused_block: None,
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: Default::default(),
@@ -9574,6 +9581,10 @@ impl Editor {
         self.breadcrumb_header = Some(new_header);
     }
 
+    pub(crate) fn dependency_display_path(&self) -> Option<&SharedString> {
+        self.dependency_display_path.as_ref()
+    }
+
     pub fn clear_search_within_ranges(&mut self, cx: &mut Context<Self>) {
         self.clear_background_highlights(HighlightKey::SearchWithinRange, cx);
     }
@@ -13440,4 +13451,24 @@ pub fn multibuffer_context_lines(cx: &App) -> u32 {
         .map(|settings| settings.excerpt_context_lines)
         .unwrap_or(2)
         .min(32)
+}
+
+/// Read the JDT sidecar next to a cached dependency document and turn it into a
+/// library path. The sidecar is tiny and local; reading it here avoids showing
+/// the temporary decompilation path while the editor is first rendered.
+fn dependency_display_path_for_buffer(
+    multi_buffer: &Entity<MultiBuffer>,
+    cx: &App,
+) -> Option<project::java_dependencies::DependencyDisplayPath> {
+    let buffer = multi_buffer.read(cx).as_singleton()?;
+    let file = project::File::from_dyn(buffer.read(cx).file())?;
+    let path = file.abs_path(cx);
+    if !path
+        .components()
+        .any(|component| component.as_os_str() == "jdtls_decompiled")
+    {
+        return None;
+    }
+    let jdt_uri = std::fs::read_to_string(path.with_added_extension("jdt-uri")).ok()?;
+    project::java_dependencies::dependency_display_path(jdt_uri.trim())
 }

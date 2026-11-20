@@ -1,3 +1,4 @@
+mod external_libraries;
 pub mod project_panel_settings;
 mod undo;
 mod utils;
@@ -12,6 +13,7 @@ use editor::{
         entry_diagnostic_aware_icon_name_and_color, entry_git_aware_label_color,
     },
 };
+use external_libraries::{ExternalLibraries, ResizeExternalLibraries};
 use file_icons::FileIcons;
 use fs::TrashId;
 use git;
@@ -139,7 +141,9 @@ impl State {
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
+    panel_focus_handle: FocusHandle,
     focus_handle: FocusHandle,
+    external_libraries: Entity<ExternalLibraries>,
     scroll_handle: UniformListScrollHandle,
     // An update loop that keeps incrementing/decrementing scroll offset while there is a dragged entry that's
     // hovered over the start/end of a list.
@@ -376,6 +380,10 @@ struct SelectPrevDiagnostic {
 actions!(
     project_panel,
     [
+        /// Moves keyboard focus to External Libraries in the visible project panel.
+        FocusExternalLibraries,
+        /// Moves keyboard focus back to the project file tree.
+        FocusFileTree,
         /// Expands the selected entry in the project tree.
         ExpandSelectedEntry,
         /// Collapses the selected entry in the project tree.
@@ -516,6 +524,18 @@ pub fn init(cx: &mut App) {
             if !workspace.toggle_panel_focus::<ProjectPanel>(window, cx) {
                 workspace.close_panel::<ProjectPanel>(window, cx);
             }
+        });
+        workspace.register_action(|workspace, _: &FocusExternalLibraries, window, cx| {
+            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.external_libraries.update(cx, |libraries, cx| {
+                        libraries.focus(window, cx);
+                    });
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &FocusFileTree, window, cx| {
+            workspace.focus_panel::<ProjectPanel>(window, cx);
         });
 
         workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
@@ -718,6 +738,15 @@ impl ProjectPanel {
         let git_store = project.read(cx).git_store().clone();
         let path_style = project.read(cx).path_style(cx);
         let project_panel = cx.new(|cx| {
+            let panel_focus_handle = cx.focus_handle();
+            cx.on_focus(
+                &panel_focus_handle,
+                window,
+                |this: &mut Self, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                },
+            )
+            .detach();
             let focus_handle = cx.focus_handle();
             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
 
@@ -860,6 +889,21 @@ impl ProjectPanel {
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let new_settings = *ProjectPanelSettings::get_global(cx);
                 if project_panel_settings != new_settings {
+                    if project_panel_settings.show_external_libraries
+                        != new_settings.show_external_libraries
+                    {
+                        if !new_settings.show_external_libraries
+                            && this
+                                .external_libraries
+                                .focus_handle(cx)
+                                .contains_focused(window, cx)
+                        {
+                            this.focus_handle.focus(window, cx);
+                        }
+                        this.external_libraries.update(cx, |libraries, cx| {
+                            libraries.set_enabled(new_settings.show_external_libraries, cx);
+                        });
+                    }
                     if project_panel_settings.hide_gitignore != new_settings.hide_gitignore {
                         this.update_visible_entries(None, false, false, window, cx);
                     }
@@ -887,11 +931,15 @@ impl ProjectPanel {
 
             let scroll_handle = UniformListScrollHandle::new();
             let weak_project_panel = cx.weak_entity();
+            let external_libraries =
+                cx.new(|cx| ExternalLibraries::new(project.clone(), workspace.weak_handle(), cx));
             let mut this = Self {
                 project: project.clone(),
                 hover_scroll_task: None,
                 fs: workspace.app_state().fs.clone(),
+                panel_focus_handle,
                 focus_handle,
+                external_libraries,
                 rendered_entries_len: 0,
                 folded_directory_drag_target: None,
                 drag_target_entry: None,
@@ -1118,7 +1166,7 @@ impl ProjectPanel {
     /// this everywhere as this is not a proper fix here but a mere workaround. Yet
     /// a fix would require some more time and thought to not break other users of this
     fn contains_focus(&self, window: &Window, cx: &App) -> bool {
-        self.focus_handle.contains_focused(window, cx)
+        self.panel_focus_handle.contains_focused(window, cx)
             || self
                 .context_menu
                 .as_ref()
@@ -7525,8 +7573,12 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
     item_width
 }
 
-impl Render for ProjectPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ProjectPanel {
+    fn render_project_tree(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         if !cx.has_active_drag() {
             self.clear_drag_state(cx);
         }
@@ -7725,7 +7777,7 @@ impl Render for ProjectPanel {
                     el.on_action(cx.listener(Self::open_in_terminal))
                         .on_action(cx.listener(Self::download_from_remote))
                 })
-                .track_focus(&self.focus_handle(cx))
+                .track_focus(&self.focus_handle)
                 .child(
                     v_flex()
                         .child(
@@ -8071,7 +8123,7 @@ impl Render for ProjectPanel {
                                     cx.stop_propagation();
                                     this.selection = None;
                                     this.marked_entries.clear();
-                                    this.focus_handle(cx).focus(window, cx);
+                                    this.focus_handle.focus(window, cx);
                                 }))
                                 .on_mouse_down(
                                     MouseButton::Right,
@@ -8146,7 +8198,7 @@ impl Render for ProjectPanel {
                     .with_priority(3)
                 }))
         } else {
-            let focus_handle = self.focus_handle(cx);
+            let focus_handle = self.focus_handle.clone();
             let workspace = self.workspace.clone();
             let workspace_clone = self.workspace.clone();
 
@@ -8208,6 +8260,39 @@ impl Render for ProjectPanel {
     }
 }
 
+impl Render for ProjectPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_external_libraries = ProjectPanelSettings::get_global(cx).show_external_libraries;
+        v_flex()
+            .id("project-panel-sections")
+            .track_focus(&self.panel_focus_handle)
+            .size_full()
+            .overflow_hidden()
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<ResizeExternalLibraries>, _, cx| {
+                    let maximum_height = (event.bounds.size.height * 0.65).max(px(80.));
+                    let height = (event.bounds.bottom() - event.event.position.y)
+                        .max(px(80.))
+                        .min(maximum_height);
+                    this.external_libraries.update(cx, |libraries, cx| {
+                        libraries.resize(height, cx);
+                    });
+                },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_project_tree(window, cx)),
+            )
+            .when(show_external_libraries, |panel| {
+                panel.child(self.external_libraries.clone())
+            })
+    }
+}
+
 impl Render for DraggedProjectEntryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
@@ -8250,6 +8335,10 @@ impl EventEmitter<Event> for ProjectPanel {}
 impl EventEmitter<PanelEvent> for ProjectPanel {}
 
 impl Panel for ProjectPanel {
+    fn activation_focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
     fn position(&self, _: &Window, cx: &App) -> DockPosition {
         match ProjectPanelSettings::get_global(cx).dock {
             DockSide::Left => DockPosition::Left,
@@ -8311,6 +8400,9 @@ impl Panel for ProjectPanel {
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.external_libraries.update(cx, |libraries, cx| {
+            libraries.set_panel_visible(active, cx);
+        });
         if active {
             cx.defer_in(window, |panel, window, cx| {
                 panel.preload_initial_entry_icons(window, cx);
@@ -8350,7 +8442,7 @@ impl ProjectPanel {
 
 impl Focusable for ProjectPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+        self.panel_focus_handle.clone()
     }
 }
 

@@ -385,6 +385,7 @@ pub struct LocalLspStore {
     lsp_tree: LanguageServerTree,
     registered_buffers: HashMap<BufferId, usize>,
     buffers_opened_in_servers: HashMap<BufferId, HashSet<LanguageServerId>>,
+    java_dependency_servers: HashMap<PathBuf, JavaDependencyServer>,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -1166,6 +1167,36 @@ impl LocalLspStore {
             .detach();
 
         language_server
+            .on_notification::<crate::java_dependencies::JavaDependencyEvent, _>({
+                let store = lsp_store.clone();
+                move |params, cx| {
+                    let Some(event_type) = params.get("eventType").and_then(Value::as_u64) else {
+                        return;
+                    };
+                    if !matches!(event_type, 100 | 200 | 210) {
+                        return;
+                    }
+                    let project_uri = if event_type == 100 {
+                        params
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    if let Err(error) = store.update(cx, |_, cx| {
+                        cx.emit(LspStoreEvent::JavaDependenciesChanged {
+                            server_id,
+                            project_uri,
+                        });
+                    }) {
+                        log::debug!("Java dependency event after project closed: {error}");
+                    }
+                }
+            })
+            .detach();
+
+        language_server
             .on_request::<lsp::request::ApplyWorkspaceEdit, _, _>({
                 let this = lsp_store.clone();
                 move |params, cx| {
@@ -1503,6 +1534,12 @@ impl LocalLspStore {
         cx: &mut App,
     ) -> Vec<LanguageServerId> {
         if let Some((file, language)) = File::from_dyn(buffer.file()).zip(buffer.language()) {
+            if let Some(binding) = self
+                .java_dependency_servers
+                .get(file.abs_path(cx).as_path())
+            {
+                return vec![binding.server_id];
+            }
             let worktree_id = file.worktree_id(cx);
 
             let path: Arc<RelPath> = file
@@ -3228,16 +3265,22 @@ impl LocalLspStore {
             return;
         };
         let initial_snapshot = buffer.text_snapshot();
-        let worktree_id = file.worktree_id(cx);
+        let dependency_server = self.java_dependency_servers.get(&abs_path).cloned();
+        let worktree_id = dependency_server
+            .as_ref()
+            .map_or_else(|| file.worktree_id(cx), |binding| binding.seed.worktree_id);
 
         let Some(language) = buffer.language().cloned() else {
             return;
         };
-        let path: Arc<RelPath> = file
-            .path()
-            .parent()
-            .map(Arc::from)
-            .unwrap_or_else(|| file.path().clone());
+        let path: Arc<RelPath> = if let Some(binding) = dependency_server.as_ref() {
+            binding.project_path.clone()
+        } else {
+            file.path()
+                .parent()
+                .map(Arc::from)
+                .unwrap_or_else(|| file.path().clone())
+        };
         let Some(worktree) = self
             .worktree_store
             .read(cx)
@@ -3245,78 +3288,128 @@ impl LocalLspStore {
         else {
             return;
         };
-        let language_name = language.name();
-        let (delegate, servers) = self
-            .reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
-            .map(|(delegate, apply)| (delegate, apply(&mut self.lsp_tree)))
-            .unwrap_or_else(|| {
-                let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
-                let delegate: Arc<dyn ManifestDelegate> =
-                    Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
-
-                let servers = self
-                    .lsp_tree
-                    .walk(
-                        ProjectPath { worktree_id, path },
-                        language.name(),
-                        language.manifest(),
-                        &delegate,
-                        cx,
-                    )
-                    .collect::<Vec<_>>();
-                (lsp_delegate, servers)
-            });
-        let servers_and_adapters = servers
-            .into_iter()
-            .filter_map(|server_node| {
-                if !only_register_servers.is_empty() {
-                    if let Some(server_id) = server_node.server_id()
-                        && !only_register_servers.contains(&LanguageServerSelector::Id(server_id))
-                    {
-                        return None;
-                    }
-                    if let Some(name) = server_node.name()
-                        && !only_register_servers.contains(&LanguageServerSelector::Name(name))
-                    {
-                        return None;
-                    }
-                }
-
-                let server_id = server_node.server_id_or_init(|disposition| {
-                    let path = &disposition.path;
-
-                    {
-                        let workspace_folder = workspace_folder_uri(worktree.read(cx), &path.path);
-
-                        let server_id = self.get_or_insert_language_server(
-                            &worktree,
-                            delegate.clone(),
-                            disposition,
-                            &language_name,
-                            start_mode,
-                            cx,
-                        )?;
-
-                        if let Some(state) = self.language_servers.get(&server_id)
-                            && let Some(workspace_folder) = workspace_folder
-                        {
-                            state.add_workspace_folder(workspace_folder);
-                        };
-                        Some(server_id)
-                    }
-                })?;
-                let server_state = self.language_servers.get(&server_id)?;
-                if let LanguageServerState::Running {
+        // A decompiled document belongs to the server that supplied its JDT handle.
+        // Reusing an arbitrary Java server loses the module's classpath and bindings.
+        let pinned = dependency_server.as_ref().and_then(|binding| {
+            match self.language_servers.get(&binding.server_id) {
+                Some(LanguageServerState::Running {
                     server, adapter, ..
-                } = server_state
-                {
-                    Some((server.clone(), adapter.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+                }) => Some((server.clone(), adapter.clone())),
+                _ => None,
+            }
+        });
+        let servers_and_adapters = if let Some(server) = pinned {
+            vec![server]
+        } else {
+            let language_name = language.name();
+            let reusable = if dependency_server.is_some() {
+                None
+            } else {
+                self.reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
+            };
+            let (delegate, servers) = reusable
+                .map(|(delegate, apply)| (delegate, apply(&mut self.lsp_tree)))
+                .unwrap_or_else(|| {
+                    let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
+                    let delegate: Arc<dyn ManifestDelegate> =
+                        Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
+
+                    let servers = self
+                        .lsp_tree
+                        .walk(
+                            ProjectPath { worktree_id, path },
+                            language.name(),
+                            language.manifest(),
+                            &delegate,
+                            cx,
+                        )
+                        .collect::<Vec<_>>();
+                    (lsp_delegate, servers)
+                });
+            servers
+                .into_iter()
+                .filter_map(|server_node| {
+                    if dependency_server.is_some()
+                        && server_node
+                            .name()
+                            .is_none_or(|name| name.to_string() != "jdtls")
+                    {
+                        return None;
+                    }
+                    if !only_register_servers.is_empty() {
+                        if let Some(server_id) = server_node.server_id()
+                            && !only_register_servers
+                                .contains(&LanguageServerSelector::Id(server_id))
+                        {
+                            return None;
+                        }
+                        if let Some(name) = server_node.name()
+                            && !only_register_servers.contains(&LanguageServerSelector::Name(name))
+                        {
+                            return None;
+                        }
+                    }
+
+                    let server_id = server_node.server_id_or_init(|disposition| {
+                        if let Some(binding) = dependency_server.as_ref()
+                            && (disposition.toolchain != binding.seed.toolchain
+                                || disposition.settings.binary != binding.seed.settings.binary
+                                || disposition.settings.initialization_options
+                                    != binding.seed.settings.initialization_options)
+                        {
+                            return None;
+                        }
+                        let path = &disposition.path;
+
+                        {
+                            let workspace_folder =
+                                workspace_folder_uri(worktree.read(cx), &path.path);
+
+                            let server_id = self.get_or_insert_language_server(
+                                &worktree,
+                                delegate.clone(),
+                                disposition,
+                                &language_name,
+                                start_mode,
+                                cx,
+                            )?;
+
+                            if let Some(state) = self.language_servers.get(&server_id)
+                                && let Some(workspace_folder) = workspace_folder
+                            {
+                                state.add_workspace_folder(workspace_folder);
+                            };
+                            Some(server_id)
+                        }
+                    })?;
+                    if let Some(binding) = dependency_server.as_ref()
+                        && !self
+                            .language_server_ids
+                            .get(&binding.seed)
+                            .is_some_and(|state| state.id == server_id)
+                    {
+                        return None;
+                    }
+                    let server_state = self.language_servers.get(&server_id)?;
+                    if let LanguageServerState::Running {
+                        server, adapter, ..
+                    } = server_state
+                    {
+                        Some((server.clone(), adapter.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         for (server, adapter) in servers_and_adapters {
+            if let Some(binding) = dependency_server.as_ref() {
+                server
+                    .notify::<crate::java_dependencies::JavaDependencyDocument>(serde_json::json!({
+                        "uri": uri, "jdtUri": binding.original_uri,
+                    }))
+                    .log_err();
+            }
             buffer_handle.update(cx, |buffer, cx| {
                 buffer.set_completion_triggers(
                     server.server_id(),
@@ -4717,6 +4810,14 @@ impl BufferLspData {
 
 #[derive(Debug)]
 pub enum LspStoreEvent {
+    JavaDependenciesChanged {
+        server_id: LanguageServerId,
+        project_uri: Option<String>,
+    },
+    JavaDependencyDocumentOpened {
+        server_id: LanguageServerId,
+        jdt_uri: String,
+    },
     LanguageServerAdded(LanguageServerId, LanguageServerName, Option<WorktreeId>),
     SupplementaryLanguageServerAdded(LanguageServerId, LanguageServerName),
     LanguageServerRemoved(LanguageServerId),
@@ -5015,6 +5116,7 @@ impl LspStore {
                 toolchain_store,
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
+                java_dependency_servers: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
@@ -5424,6 +5526,7 @@ impl LspStore {
                         local.unregister_old_buffer_from_language_servers(&buffer.0, &file, cx);
 
                         let buffer_abs_path = file.abs_path(cx);
+                        local.java_dependency_servers.remove(&buffer_abs_path);
                         for (_, buffer_pull_diagnostics_result_ids) in
                             &mut local.buffer_pull_diagnostics_result_ids
                         {
@@ -10590,6 +10693,58 @@ impl LspStore {
             let abs_path = abs_path
                 .to_file_path_ext(path_style)
                 .map_err(|()| anyhow!("can't convert URI to path"))?;
+            let dependency_server = if abs_path
+                .components()
+                .any(|component| component.as_os_str() == "jdtls_decompiled")
+            {
+                let fs = lsp_store
+                    .read_with(cx, |store, _| {
+                        store.as_local().map(|local| local.fs.clone())
+                    })?
+                    .context("Java dependency documents require a local workspace")?;
+                let original_uri = fs
+                    .load(&abs_path.with_added_extension("jdt-uri"))
+                    .await
+                    .ok()
+                    .filter(|uri| uri.starts_with("jdt://"));
+                lsp_store.read_with(cx, |store, _| {
+                    let status = store.language_server_statuses.get(&language_server_id)?;
+                    let local = store.as_local()?;
+                    // Invisible worktrees also reference this ID; keep the original launch identity.
+                    let (seed, state) =
+                        local.language_server_ids.iter().find(|(seed, state)| {
+                            state.id == language_server_id
+                                && Some(seed.worktree_id) == status.worktree
+                        })?;
+                    (status.name.to_string() == "jdtls").then_some(JavaDependencyServer {
+                        server_id: language_server_id,
+                        seed: seed.clone(),
+                        project_path: state.project_roots.iter().next()?.clone(),
+                        original_uri: original_uri?,
+                    })
+                })?
+            } else {
+                None
+            };
+            let is_java_dependency = dependency_server.is_some();
+            let dependency_document = dependency_server
+                .as_ref()
+                .map(|server| (server.server_id, server.original_uri.clone()));
+            if let Some(binding) = dependency_server {
+                lsp_store.update(cx, |store, _| {
+                    if let Some(local) = store.as_local_mut() {
+                        local
+                            .java_dependency_servers
+                            .entry(abs_path.clone())
+                            .or_insert(binding);
+                    }
+                })?;
+            }
+            if let Some((server_id, jdt_uri)) = dependency_document {
+                lsp_store.update(cx, |_, cx| {
+                    cx.emit(LspStoreEvent::JavaDependencyDocumentOpened { server_id, jdt_uri });
+                })?;
+            }
             let p = abs_path.clone();
             let yarn_worktree = lsp_store
                 .update(cx, move |lsp_store, cx| match lsp_store.as_local() {
@@ -10672,6 +10827,21 @@ impl LspStore {
                     })
                 })?
                 .await?;
+            if is_java_dependency {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_capability(Capability::ReadOnly, cx)
+                });
+                lsp_store.update(cx, |store, cx| {
+                    if let Some(local) = store.as_local_mut() {
+                        local.register_buffer_with_language_servers(
+                            &buffer,
+                            HashSet::default(),
+                            LanguageServerStartMode::Automatic,
+                            cx,
+                        );
+                    }
+                })?;
+            }
             // we want to adhere to the read-only settings of the worktree we came from in case we opened an invisible one
             if let Some((source_ws, worktree_root)) = source_ws {
                 buffer.update(cx, |buffer, cx| {
@@ -13698,6 +13868,16 @@ impl LspStore {
             },
         );
 
+        if key.name.to_string() == "jdtls"
+            && let Some(local) = self.as_local_mut()
+        {
+            // A restart changes the server ID; retain the originating project for cached documents.
+            for binding in local.java_dependency_servers.values_mut() {
+                if binding.seed == key && !local.language_servers.contains_key(&binding.server_id) {
+                    binding.server_id = server_id;
+                }
+            }
+        }
         cx.emit(LspStoreEvent::LanguageServerAdded(
             server_id,
             language_server.name(),
@@ -13761,7 +13941,14 @@ impl LspStore {
                     continue;
                 }
 
-                if !worktrees_using_server.contains(&file.worktree.read(cx).id())
+                let belongs_to_server = self
+                    .as_local()
+                    .and_then(|local| local.java_dependency_servers.get(&file.abs_path(cx)))
+                    .map_or_else(
+                        || worktrees_using_server.contains(&file.worktree.read(cx).id()),
+                        |binding| binding.server_id == server_id,
+                    );
+                if !belongs_to_server
                     || !lsp_adapters
                         .entry(language.name())
                         .or_insert_with(|| self.languages.lsp_adapters(&language.name()))
@@ -13810,6 +13997,15 @@ impl LspStore {
                     let snapshot = versions.last().unwrap();
                     let version = snapshot.version;
                     let initial_snapshot = &snapshot.snapshot;
+                    if let Some(binding) = local.java_dependency_servers.get(&abs_path) {
+                        language_server
+                            .notify::<crate::java_dependencies::JavaDependencyDocument>(
+                                serde_json::json!({
+                                    "uri": uri, "jdtUri": binding.original_uri,
+                                }),
+                            )
+                            .log_err();
+                    }
                     language_server.register_buffer(
                         uri,
                         adapter.language_id(&language.name()),
@@ -16740,6 +16936,14 @@ pub struct WorkspaceRefreshTask {
     current_request_token: Option<String>,
     #[allow(dead_code)]
     task: Task<()>,
+}
+
+#[derive(Clone)]
+struct JavaDependencyServer {
+    server_id: LanguageServerId,
+    seed: LanguageServerSeed,
+    project_path: Arc<RelPath>,
+    original_uri: String,
 }
 
 pub enum LanguageServerState {
