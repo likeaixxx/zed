@@ -3796,7 +3796,6 @@ impl LocalLspStore {
         Ok(transaction)
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn edits_from_lsp(
         &mut self,
         buffer: &Entity<Buffer>,
@@ -12429,9 +12428,7 @@ impl LspStore {
                         if progress.percentage.is_some() {
                             entry.percentage = progress.percentage;
                         }
-                        if progress.is_cancellable != entry.is_cancellable {
-                            entry.is_cancellable = progress.is_cancellable;
-                        }
+                        entry.is_cancellable = progress.is_cancellable;
                         did_update = true;
                     }
                 }
@@ -17421,14 +17418,10 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
 
     async fn language_server_download_dir(&self, name: &LanguageServerName) -> Option<Arc<Path>> {
         let dir = self.language_registry.language_server_download_dir(name)?;
-
-        if !dir.exists() {
-            smol::fs::create_dir_all(&dir)
-                .await
-                .context("failed to create container directory")
-                .log_err()?;
-        }
-
+        smol::fs::create_dir_all(&dir)
+            .await
+            .context("failed to create container directory")
+            .log_err()?;
         Some(dir)
     }
 
