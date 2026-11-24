@@ -8,10 +8,12 @@ use crate::{
     commit_view::{CommitView, CommitViewOptions},
     git_status_icon,
     git_timestamp::format_git_timestamp,
+    line_history::LineHistoryView,
 };
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
+use futures::{FutureExt as _, future::Shared};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
@@ -67,6 +69,7 @@ use util::{ResultExt, debug_panic};
 use workspace::{
     ItemNavHistory, ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::NotifyTaskExt as _,
 };
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.5);
@@ -539,6 +542,7 @@ struct SearchState {
     state: QueryState,
     matches: IndexSet<Oid>,
     selected_index: Option<usize>,
+    error: Option<SharedString>,
 }
 
 struct SplitState {
@@ -1079,6 +1083,9 @@ pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<GitGraph>(cx);
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action(|workspace, _: &git::LineHistory, window, cx| {
+            open_line_history(workspace, window, cx);
+        });
         workspace.register_action_renderer(|div, workspace, window, cx| {
             div.when_some(
                 resolve_file_history_target(workspace, window, cx),
@@ -1213,6 +1220,36 @@ fn resolve_file_history_target(
         .read(cx)
         .repository_and_path_for_project_path(&project_path, cx)?;
     Some((repo.read(cx).id, LogSource::Path(repo_path)))
+}
+
+fn open_line_history(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return;
+    };
+    let target_task = editor.update(cx, |editor, cx| editor.line_history_target(cx));
+    let git_store = workspace.project().read(cx).git_store().clone();
+    let workspace = workspace.weak_handle();
+    window
+        .spawn(cx, {
+            let workspace = workspace.clone();
+            async move |cx| {
+                let (repository, target) = target_task.await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let repo_id = repository.read(cx).id;
+                    open_or_reuse_graph(
+                        workspace,
+                        repo_id,
+                        git_store,
+                        LogSource::Line(target),
+                        None,
+                        window,
+                        cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            }
+        })
+        .detach_and_notify_err(workspace, window, cx);
 }
 
 pub fn open_or_reuse_graph(
@@ -1455,6 +1492,15 @@ struct DetailPanelCommitMessage {
     scroll_handle: ScrollHandle,
 }
 
+type LineHistoryPatchTask = Shared<Task<Result<Arc<HashMap<Oid, String>>, SharedString>>>;
+
+#[derive(Default)]
+struct LineHistoryState {
+    patches: Option<LineHistoryPatchTask>,
+    preview: Option<Entity<LineHistoryView>>,
+    _load_task: Option<Task<()>>,
+}
+
 pub struct GitGraph {
     focus_handle: FocusHandle,
     search_state: SearchState,
@@ -1477,6 +1523,7 @@ pub struct GitGraph {
     selected_commit_diff: Option<CommitDiff>,
     selected_commit_diff_stats: Option<(usize, usize)>,
     _commit_diff_task: Option<Task<()>>,
+    line_history: LineHistoryState,
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
@@ -1500,6 +1547,7 @@ impl GitGraph {
         self.graph_data.clear();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
+        self.search_state.error = None;
         self.search_state.state.next_state();
         self.context_menu = None;
         cx.emit(ItemEvent::Edit);
@@ -1513,6 +1561,7 @@ impl GitGraph {
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self._commit_diff_task = None;
+        self.line_history.preview = None;
         self.selected_commit_message = None;
         self._selected_commit_message_task = None;
         self.changed_files_expanded_dirs.clear();
@@ -1559,7 +1608,7 @@ impl GitGraph {
     }
 
     fn is_path_history(&self) -> bool {
-        matches!(self.log_source, LogSource::Path(_))
+        matches!(self.log_source, LogSource::Path(_) | LogSource::Line(_))
     }
 
     fn is_column_visible(&self, col_idx: usize) -> bool {
@@ -1682,7 +1731,7 @@ impl GitGraph {
             state
         });
 
-        let column_widths = if matches!(log_source, LogSource::Path(_)) {
+        let column_widths = if matches!(log_source, LogSource::Path(_) | LogSource::Line(_)) {
             cx.new(|_cx| {
                 RedistributableColumnsState::new(
                     4,
@@ -1716,7 +1765,7 @@ impl GitGraph {
         };
         let column_visibility = TableRow::from_element(
             false,
-            if matches!(log_source, LogSource::Path(_)) {
+            if matches!(log_source, LogSource::Path(_) | LogSource::Line(_)) {
                 TABLE_COLUMN_COUNT
             } else {
                 GRAPH_LAYOUT_TABLE_OFFSET + TABLE_COLUMN_COUNT
@@ -1757,10 +1806,12 @@ impl GitGraph {
                 matches: IndexSet::default(),
                 selected_index: None,
                 state: QueryState::Empty,
+                error: None,
             },
             workspace,
             graph_data: graph,
             _commit_diff_task: None,
+            line_history: LineHistoryState::default(),
             context_menu: None,
             table_interaction_state,
             column_widths,
@@ -2280,6 +2331,7 @@ impl GitGraph {
 
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
+        self.search_state.error = None;
         self.search_state.editor.update(cx, |editor, _cx| {
             editor.set_text_style_refinement(Default::default());
         });
@@ -2292,7 +2344,7 @@ impl GitGraph {
 
         let (request_tx, request_rx) = async_channel::unbounded::<Oid>();
 
-        repo.update(cx, |repo, cx| {
+        let query_task = repo.update(cx, |repo, cx| {
             repo.search_commits(
                 self.log_source.clone(),
                 SearchCommitArgs {
@@ -2301,7 +2353,7 @@ impl GitGraph {
                 },
                 request_tx,
                 cx,
-            );
+            )
         });
 
         let search_task = cx.spawn(async move |this, cx| {
@@ -2323,7 +2375,12 @@ impl GitGraph {
                 .ok();
             }
 
+            let error = query_task
+                .await
+                .err()
+                .map(|error| SharedString::from(error.to_string()));
             this.update(cx, |this, cx| {
+                this.search_state.error = error;
                 if this.search_state.matches.is_empty() {
                     this.search_state.editor.update(cx, |editor, cx| {
                         editor.set_text_style_refinement(TextStyleRefinement {
@@ -2332,6 +2389,7 @@ impl GitGraph {
                         });
                     });
                 }
+                cx.notify();
             })
             .ok();
         });
@@ -2430,6 +2488,15 @@ impl GitGraph {
 
         self.load_selected_commit_message(cx, &sha, &repository);
 
+        if matches!(self.log_source, LogSource::Line(_)) {
+            self._commit_diff_task = None;
+            self.line_history.preview = None;
+            let _patch_task = self.ensure_line_history_patches(cx);
+            cx.emit(ItemEvent::Edit);
+            cx.notify();
+            return;
+        }
+
         let diff_task =
             repository.update(cx, |repo, cx| repo.load_commit_diff(diff_handle, false, cx));
 
@@ -2455,6 +2522,7 @@ impl GitGraph {
         sha: &Oid,
         repository: &Entity<Repository>,
     ) {
+        self._selected_commit_message_task = None;
         if self
             .selected_commit_message
             .as_ref()
@@ -2463,7 +2531,7 @@ impl GitGraph {
             return;
         }
 
-        self._selected_commit_message_task = None;
+        self.selected_commit_message = None;
         match repository.update(cx, |repo, cx| {
             repo.fetch_commit_data(*sha, true, cx).clone()
         }) {
@@ -2498,6 +2566,10 @@ impl GitGraph {
         sha: Oid,
         message: SharedString,
     ) {
+        // A completed request must not replace the details of a newer selection.
+        if self.selected_commit_sha != Some(sha) {
+            return;
+        }
         let languages = self
             .workspace
             .read_with(cx, |workspace, cx| {
@@ -2558,7 +2630,8 @@ impl GitGraph {
     }
 
     pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
-        if repo_id != self.repo_id
+        if !matches!(self.log_source, LogSource::Line(_))
+            && repo_id != self.repo_id
             && self
                 .git_store
                 .read(cx)
@@ -2596,6 +2669,70 @@ impl GitGraph {
         }
     }
 
+    fn ensure_line_history_patches(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<LineHistoryPatchTask> {
+        if let Some(task) = &self.line_history.patches {
+            return Some(task.clone());
+        }
+        let LogSource::Line(target) = &self.log_source else {
+            return None;
+        };
+        let repository = self.get_repository(cx)?;
+        let task = repository.read(cx).line_history_patches(target.clone(), cx);
+        let patches = cx
+            .background_spawn(async move {
+                task.await
+                    .map(Arc::new)
+                    .map_err(|error| SharedString::from(error.to_string()))
+            })
+            .shared();
+        self.line_history.patches = Some(patches.clone());
+        self.line_history._load_task = Some(cx.spawn({
+            let patches = patches.clone();
+            async move |this, cx| {
+                patches.await.log_err();
+                this.update(cx, |_, cx| cx.notify()).log_err();
+            }
+        }));
+        Some(patches)
+    }
+
+    fn open_line_history_patch(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let LogSource::Line(target) = self.log_source.clone() else {
+            return;
+        };
+        let Some(patches) = self.ensure_line_history_patches(cx) else {
+            return;
+        };
+        let repository_id = self.repo_id;
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, {
+                let workspace = workspace.clone();
+                async move |cx| {
+                    let patches = patches.await.map_err(|error| anyhow::anyhow!(error))?;
+                    let patch = patches.get(&sha).ok_or_else(|| {
+                        anyhow::anyhow!("No line changes are available for this commit")
+                    })?;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        LineHistoryView::open(
+                            repository_id,
+                            target,
+                            sha,
+                            patch,
+                            workspace,
+                            window,
+                            cx,
+                        );
+                    })?;
+                    anyhow::Ok(())
+                }
+            })
+            .detach_and_notify_err(workspace, window, cx);
+    }
+
     fn open_selected_commit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(selected_entry_index) = self.selected_entry_idx else {
             return;
@@ -2613,6 +2750,11 @@ impl GitGraph {
         let Some(commit_entry) = self.graph_data.commits.get(entry_index) else {
             return;
         };
+        let sha = commit_entry.data.sha;
+        if matches!(self.log_source, LogSource::Line(_)) {
+            self.open_line_history_patch(sha, window, cx);
+            return;
+        }
 
         let Some(repository) = self.get_repository(cx) else {
             return;
@@ -2804,6 +2946,32 @@ impl GitGraph {
         let repository = self
             .get_repository(cx)
             .map(|repository| repository.downgrade());
+        if matches!(self.log_source, LogSource::Line(_)) {
+            let sha = commit.data.sha;
+            let graph = cx.entity();
+            let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.context(self.focus_handle.clone())
+                    .header(format!("Commit {}", sha.display_short()))
+                    .entry(
+                        "View Diff",
+                        Some(OpenCommitView.boxed_clone()),
+                        move |window, cx| {
+                            graph.update(cx, |graph, cx| {
+                                graph.open_line_history_patch(sha, window, cx)
+                            });
+                        },
+                    )
+                    .entry(
+                        "Copy SHA",
+                        Some(CopyCommitSha.boxed_clone()),
+                        move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                        },
+                    )
+            });
+            self.set_context_menu(context_menu, position, Some(index), window, cx);
+            return;
+        }
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.data.sha,
@@ -2874,7 +3042,7 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let is_path_history = self.is_path_history();
         let columns: &[&str] = if is_path_history {
             &["Description", "Date", "Author", "Commit"]
         } else {
@@ -3058,6 +3226,18 @@ impl GitGraph {
                             ),
                     ),
             )
+            .when_some(self.search_state.error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .id("git-history-search-error")
+                        .child(
+                            Label::new("Search failed")
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                        .tooltip(Tooltip::text(error)),
+                )
+            })
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -3069,11 +3249,137 @@ impl GitGraph {
             .into_any_element()
     }
 
+    fn render_line_history_detail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (LogSource::Line(target), Some(sha)) =
+            (self.log_source.clone(), self.selected_commit_sha)
+        else {
+            return Empty.into_any_element();
+        };
+        let result = self
+            .line_history
+            .patches
+            .as_ref()
+            .and_then(|task| task.peek())
+            .cloned();
+        let content = match result {
+            Some(Ok(patches)) => match patches.get(&sha) {
+                Some(patch) => {
+                    if self
+                        .line_history
+                        .preview
+                        .as_ref()
+                        .is_none_or(|view| view.read(cx).sha != sha)
+                    {
+                        let project = self.workspace.read_with(cx, |workspace, _| {
+                            workspace.project().clone()
+                        });
+                        let Ok(project) = project else {
+                            return Empty.into_any_element();
+                        };
+                        self.line_history.preview = Some(cx.new(|cx| {
+                            LineHistoryView::new(
+                                self.repo_id,
+                                target.clone(),
+                                sha,
+                                patch,
+                                project,
+                                window,
+                                cx,
+                            )
+                        }));
+                    }
+                    div()
+                        .size_full()
+                        .children(self.line_history.preview.clone())
+                        .into_any_element()
+                }
+                None => div()
+                    .p_3()
+                    .child(
+                        Label::new("No line changes are available for this commit. History may be incomplete in this clone.")
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            },
+            Some(Err(error)) => v_flex()
+                .p_3()
+                .gap_2()
+                .child(
+                    Label::new(format!("Unable to load line changes: {error}"))
+                        .color(Color::Error),
+                )
+                .child(
+                    Button::new("retry-line-history", "Retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.line_history = LineHistoryState::default();
+                            let _patch_task = this.ensure_line_history_patches(cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .p_3()
+                .gap_2()
+                .child(self.render_loading_spinner(cx))
+                .child(Label::new("Loading line changes…").color(Color::Muted))
+                .into_any_element(),
+        };
+
+        v_flex()
+            .min_w(px(300.))
+            .h_full()
+            .bg(cx.theme().colors().editor_background)
+            .flex_basis(DefiniteLength::Fraction(
+                self.commit_details_split_state.read(cx).right_ratio(),
+            ))
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        Label::new(format!("Line {} · {}", target.line, sha.display_short()))
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        IconButton::new("close-line-history-detail", IconName::Close)
+                            .tooltip(Tooltip::text("Close Details Panel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_selection();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(self.render_commit_message(window, cx))
+            .child(Divider::horizontal())
+            .child(div().flex_1().min_h_0().overflow_hidden().child(content))
+            .child(Divider::horizontal())
+            .child(
+                div().p_1p5().child(
+                    Button::new("open-line-history-diff", "View Diff")
+                        .full_width()
+                        .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_selected_commit_view(window, cx)
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
     fn render_commit_detail_panel(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if matches!(self.log_source, LogSource::Line(_)) {
+            return self.render_line_history_detail(window, cx);
+        }
         let Some(selected_idx) = self.selected_entry_idx else {
             return Empty.into_any_element();
         };
@@ -4827,19 +5133,26 @@ impl Item for GitGraph {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
         });
+        let history_title = match &self.log_source {
+            LogSource::Line(_) => "Line History",
+            LogSource::Path(_) => "Path History",
+            _ => "Git Graph",
+        };
         let path_history_path = match &self.log_source {
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Line(target) => Some(format!(
+                "{}:L{} at {}",
+                target.path.as_unix_str(),
+                target.line,
+                target.revision.display_short()
+            )),
             _ => None,
         };
 
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             move |_, _| {
                 v_flex()
-                    .child(Label::new(if path_history_path.is_some() {
-                        "Path History"
-                    } else {
-                        "Git Graph"
-                    }))
+                    .child(Label::new(history_title))
                     .when_some(path_history_path.clone(), |this, path| {
                         this.child(Label::new(path).color(Color::Muted).size(LabelSize::Small))
                     })
@@ -4852,6 +5165,13 @@ impl Item for GitGraph {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        if let LogSource::Line(target) = &self.log_source {
+            let name = target
+                .path
+                .file_name()
+                .unwrap_or_else(|| target.path.as_unix_str());
+            return format!("{name}:L{}", target.line).into();
+        }
         if let LogSource::Path(path) = &self.log_source {
             return path
                 .as_ref()
@@ -4972,6 +5292,11 @@ impl workspace::SerializableItem for GitGraph {
                 };
 
                 let log_source = persistence::deserialize_log_source(&state);
+                anyhow::ensure!(
+                    state.log_source_type != Some(persistence::LOG_SOURCE_LINE)
+                        || matches!(log_source, LogSource::Line(_)),
+                    "Invalid saved line history target"
+                );
                 let log_order = persistence::deserialize_log_order(&state);
 
                 let git_graph = cx.new(|cx| {
@@ -5092,7 +5417,7 @@ mod persistence {
     };
     use git::{
         Oid,
-        repository::{LogOrder, LogSource, RepoPath},
+        repository::{LineHistoryTarget, LogOrder, LogSource, RepoPath},
     };
     use workspace::WorkspaceDb;
 
@@ -5136,6 +5461,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_LINE: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -5148,6 +5474,7 @@ mod persistence {
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
+            LogSource::Line(_) => LOG_SOURCE_LINE,
         }
     }
 
@@ -5157,6 +5484,14 @@ mod persistence {
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Line(target) => Some(
+                serde_json::json!([
+                    target.path.as_unix_str(),
+                    target.revision.to_string(),
+                    target.line,
+                ])
+                .to_string(),
+            ),
         }
     }
 
@@ -5189,6 +5524,20 @@ mod persistence {
                 .and_then(|v| RepoPath::new(v).ok())
                 .map(LogSource::Path)
                 .unwrap_or_default(),
+            Some(LOG_SOURCE_LINE) => state
+                .log_source_value
+                .as_ref()
+                .and_then(|value| serde_json::from_str::<(String, String, u32)>(value).ok())
+                .filter(|(_, _, line)| *line > 0)
+                .and_then(|(path, revision, line)| {
+                    Some(LineHistoryTarget {
+                        path: RepoPath::new(&path).ok()?,
+                        revision: Oid::from_str(&revision).ok()?,
+                        line,
+                    })
+                })
+                .map(LogSource::Line)
+                .unwrap_or_default(),
             None | Some(_) => LogSource::default(),
         }
     }
@@ -5207,7 +5556,7 @@ mod persistence {
     /// The refs column uses bit 5 for backward compatibility with previously saved masks.
     pub fn hidden_column_bits(log_source: &LogSource) -> &'static [usize] {
         match log_source {
-            LogSource::Path(_) => &[0, 1, 2, 3],
+            LogSource::Path(_) | LogSource::Line(_) => &[0, 1, 2, 3],
             _ => &[5, 0, 1, 2, 3, 4],
         }
     }
@@ -5444,6 +5793,7 @@ mod tests {
     use collections::{HashMap, HashSet};
     use fs::FakeFs;
     use git::Oid;
+    use git::repository::LineHistoryTarget;
     use git::repository::{CommitData, InitialGraphCommitData};
     use gpui::{TestAppContext, UpdateGlobal};
     use project::git_store::{GitStoreEvent, RepositoryEvent};
@@ -5455,6 +5805,7 @@ mod tests {
     use settings::{SettingsStore, ThemeSettingsContent};
     use smallvec::{SmallVec, smallvec};
     use std::path::Path;
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
     #[gpui::test]
@@ -6952,6 +7303,153 @@ mod tests {
                 LogSource::Path(tracked_repo_path)
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_line_history_tabs_keep_revision_and_line_scope(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new(util::path!("/project")),
+            json!({ ".git": {}, "file.txt": "first\nsecond\n" }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new(util::path!("/project"))], cx).await;
+        cx.run_until_parked();
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let target = LineHistoryTarget {
+            path: RepoPath::new(&"file.txt").unwrap(),
+            revision: Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
+            line: 1,
+        };
+        let sources = [
+            target.clone(),
+            target.clone(),
+            LineHistoryTarget {
+                line: 2,
+                ..target.clone()
+            },
+            LineHistoryTarget {
+                revision: Oid::from_str("2222222222222222222222222222222222222222").unwrap(),
+                ..target.clone()
+            },
+        ];
+        for source in sources {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let git_store = project.read(cx).git_store().clone();
+                open_or_reuse_graph(
+                    workspace,
+                    repository.read(cx).id,
+                    git_store,
+                    LogSource::Line(source),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        }
+        workspace.read_with(cx, |workspace, cx| {
+            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            assert_eq!(graphs.len(), 3);
+            for graph in graphs {
+                let graph = graph.read(cx);
+                assert!(graph.is_path_history());
+                assert!(!graph.is_refs_column_visible());
+                assert!(!graph.is_graph_column_visible());
+                assert_eq!(graph.column_visibility.as_slice().len(), 4);
+                let LogSource::Line(target) = &graph.log_source else {
+                    panic!("expected line history")
+                };
+                assert_eq!(
+                    graph.tab_content_text(0, cx).as_str(),
+                    format!("file.txt:L{}", target.line)
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_line_history_commit_message_rejects_stale_requests(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new(util::path!("/project")),
+            json!({ ".git": {}, "file.txt": "content\n" }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new(util::path!("/project"))], cx).await;
+        cx.run_until_parked();
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let first = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let second = Oid::from_str("2222222222222222222222222222222222222222").unwrap();
+        let graph = workspace.update_in(cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                GitGraph::new(
+                    repository.read(cx).id,
+                    project.read(cx).git_store().clone(),
+                    workspace.weak_handle(),
+                    Some(LogSource::Line(LineHistoryTarget {
+                        path: RepoPath::new(&"file.txt").unwrap(),
+                        revision: first,
+                        line: 1,
+                    })),
+                    window,
+                    cx,
+                )
+            })
+        });
+        graph.update(cx, |graph, cx| {
+            graph.selected_commit_sha = Some(first);
+            graph.set_selected_commit_message(cx, first, "First commit".into());
+            graph._selected_commit_message_task = Some(cx.background_spawn(std::future::pending()));
+            graph.load_selected_commit_message(cx, &first, &repository);
+            assert!(graph._selected_commit_message_task.is_none());
+            graph.set_selected_commit_message(cx, second, "Stale second commit".into());
+            assert_eq!(graph.selected_commit_message.as_ref().unwrap().sha, first);
+        });
+    }
+
+    #[test]
+    fn test_line_history_serialization_preserves_full_target() {
+        let target = LineHistoryTarget {
+            path: RepoPath::new(&"目录/file with spaces:part.java").unwrap(),
+            revision: Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
+            line: 234,
+        };
+        let source = LogSource::Line(target);
+        let state = persistence::SerializedGitGraphState {
+            log_source_type: Some(persistence::serialize_log_source_type(&source)),
+            log_source_value: persistence::serialize_log_source_value(&source),
+            ..Default::default()
+        };
+        assert_eq!(persistence::deserialize_log_source(&state), source);
+        assert_eq!(persistence::hidden_column_bits(&source), &[0, 1, 2, 3]);
+
+        for value in [
+            "not json",
+            "[\"file.txt\",\"invalid\",1]",
+            "[\"file.txt\",\"1111111111111111111111111111111111111111\",0]",
+        ] {
+            let invalid = persistence::SerializedGitGraphState {
+                log_source_type: Some(persistence::LOG_SOURCE_LINE),
+                log_source_value: Some(value.into()),
+                ..Default::default()
+            };
+            assert!(!matches!(
+                persistence::deserialize_log_source(&invalid),
+                LogSource::Line(_)
+            ));
+        }
     }
 
     #[gpui::test]

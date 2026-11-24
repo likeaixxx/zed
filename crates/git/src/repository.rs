@@ -3,11 +3,11 @@ use crate::stash::GitStash;
 use crate::status::{
     DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
 };
-use crate::{Oid, RunHook, SHA256_HEX_LENGTH, SHORT_SHA_LENGTH};
+use crate::{Oid, RunHook, SHA1_HEX_LENGTH, SHA256_HEX_LENGTH, SHORT_SHA_LENGTH};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender;
 use collections::HashMap;
-use file_content::{ByteContent, decode_byte_header};
+use file_content::{ByteContent, decode_byte_header, decode_text};
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::io::BufWriter;
@@ -723,6 +723,29 @@ impl LogOrder {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LineHistoryTarget {
+    pub path: RepoPath,
+    pub revision: Oid,
+    /// The one-based line number at `revision`, as expected by `git log -L`.
+    pub line: u32,
+}
+
+impl LineHistoryTarget {
+    fn line_range_arg(&self) -> Result<String> {
+        anyhow::ensure!(
+            self.line > 0,
+            "line history requires a one-based line number"
+        );
+        Ok(format!(
+            "{},{}:{}",
+            self.line,
+            self.line,
+            self.path.as_unix_str()
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LogSource {
     #[default]
@@ -730,10 +753,11 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    Line(LineHistoryTarget),
 }
 
 impl LogSource {
-    fn get_args(&self) -> Vec<Cow<'_, str>> {
+    fn get_args(&self) -> Result<Vec<Cow<'_, str>>> {
         let mut args = match self {
             LogSource::All => vec![
                 Cow::Borrowed("--ignore-missing"), // needed in case of unborn HEAD
@@ -749,6 +773,12 @@ impl LogSource {
                 Cow::Borrowed("--"),
                 Cow::Borrowed(path.as_unix_str()),
             ],
+            LogSource::Line(target) => vec![
+                Cow::Borrowed("--no-patch"),
+                Cow::Borrowed("-L"),
+                Cow::Owned(target.line_range_arg()?),
+                Cow::Owned(target.revision.to_string()),
+            ],
         };
         // Without a terminator git cannot tell a branch named `docs/rewrite` from a
         // `docs/rewrite` directory in the working tree, and refuses the argument as
@@ -756,7 +786,7 @@ impl LogSource {
         if !matches!(self, LogSource::Path(_)) {
             args.push(Cow::Borrowed("--"));
         }
-        args
+        Ok(args)
     }
 }
 
@@ -1104,6 +1134,13 @@ pub trait GitRepository: Send + Sync {
         search_args: SearchCommitArgs,
         request_tx: Sender<Oid>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    fn line_history_patches(
+        &self,
+        _target: LineHistoryTarget,
+    ) -> BoxFuture<'_, Result<HashMap<Oid, String>>> {
+        async { bail!("line history patches are not supported by this repository") }.boxed()
+    }
 
     fn file_history_changed_files(
         &self,
@@ -3302,18 +3339,25 @@ impl GitRepository for RealGitRepository {
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary();
+        let executor = self.executor.clone();
 
         async move {
-            let log_source_args = log_source.get_args();
+            let log_source_args = log_source.get_args()?;
             let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
+            command.kill_on_drop(true);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
 
             let mut child = command.spawn()?;
             let stdout = child.stdout.take().context("failed to get stdout")?;
             let stderr = child.stderr.take().context("failed to get stderr")?;
+            let stderr_task = executor.spawn(async move {
+                let mut output = Vec::new();
+                BufReader::new(stderr).read_to_end(&mut output).await?;
+                std::io::Result::Ok(output)
+            });
             let mut reader = BufReader::new(stdout);
 
             let mut line_buffer = String::new();
@@ -3327,9 +3371,7 @@ impl GitRepository for RealGitRepository {
                     if !lines.is_empty() {
                         let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
                         if request_tx.send(commits).await.is_err() {
-                            log::warn!(
-                                "initial_graph_data: receiver dropped while sending commits"
-                            );
+                            return Ok(());
                         }
                     }
                     break;
@@ -3341,27 +3383,19 @@ impl GitRepository for RealGitRepository {
                 if lines.len() >= GRAPH_CHUNK_SIZE {
                     let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
                     if request_tx.send(commits).await.is_err() {
-                        log::warn!("initial_graph_data: receiver dropped while streaming commits");
-                        break;
+                        return Ok(());
                     }
                     lines.clear();
                 }
             }
 
             let status = child.status().await?;
-            if !status.success() {
-                let mut stderr_output = String::new();
-                BufReader::new(stderr)
-                    .read_to_string(&mut stderr_output)
-                    .await
-                    .log_err();
-
-                if stderr_output.is_empty() {
-                    anyhow::bail!("git log command failed with {}", status);
-                } else {
-                    anyhow::bail!("git log command failed with {}: {}", status, stderr_output);
-                }
-            }
+            let stderr_output = stderr_task.await?;
+            anyhow::ensure!(
+                status.success(),
+                "git log command failed with {status}: {}",
+                String::from_utf8_lossy(&stderr_output)
+            );
             Ok(())
         }
         .boxed()
@@ -3374,9 +3408,10 @@ impl GitRepository for RealGitRepository {
         request_tx: Sender<Oid>,
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary();
+        let executor = self.executor.clone();
 
         async move {
-            let log_source_args = log_source.get_args();
+            let log_source_args = log_source.get_args()?;
             let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
             let hash_query = commit_hash_search_query(search_args.query.as_str())
                 .map(|query| query.to_ascii_lowercase());
@@ -3394,11 +3429,18 @@ impl GitRepository for RealGitRepository {
 
             args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&args);
+            command.kill_on_drop(true);
             command.stdout(Stdio::piped());
-            command.stderr(Stdio::null());
+            command.stderr(Stdio::piped());
 
             let mut child = command.spawn()?;
             let stdout = child.stdout.take().context("failed to get stdout")?;
+            let stderr = child.stderr.take().context("failed to get stderr")?;
+            let stderr_task = executor.spawn(async move {
+                let mut output = Vec::new();
+                BufReader::new(stderr).read_to_end(&mut output).await?;
+                std::io::Result::Ok(output)
+            });
             let mut reader = BufReader::new(stdout);
 
             let mut line_buffer = String::new();
@@ -3421,12 +3463,52 @@ impl GitRepository for RealGitRepository {
                 if let Ok(oid) = Oid::from_str(sha)
                     && request_tx.send(oid).await.is_err()
                 {
-                    break;
+                    return Ok(());
                 }
             }
 
-            child.status().await?;
+            let status = child.status().await?;
+            let stderr_output = stderr_task.await?;
+            anyhow::ensure!(
+                status.success(),
+                "git log search failed with {status}: {}",
+                String::from_utf8_lossy(&stderr_output)
+            );
             Ok(())
+        }
+        .boxed()
+    }
+
+    fn line_history_patches(
+        &self,
+        target: LineHistoryTarget,
+    ) -> BoxFuture<'_, Result<HashMap<Oid, String>>> {
+        let git = self.git_binary();
+        async move {
+            let line_range = target.line_range_arg()?;
+            let revision = target.revision.to_string();
+            let mut command = git.build_command(&[
+                "log",
+                "--patch",
+                "--format=%x00%H%x00",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-L",
+                &line_range,
+                &revision,
+                "--",
+            ]);
+            let output = command.kill_on_drop(true).output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                GitBinaryCommandError {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    status: output.status,
+                }
+            );
+            parse_line_history_patches(&output.stdout)
         }
         .boxed()
     }
@@ -3635,6 +3717,72 @@ fn parse_file_history_changed_files_output(
     }
 
     histories
+}
+
+fn parse_line_history_patches(output: &[u8]) -> Result<HashMap<Oid, String>> {
+    let mut patches = HashMap::<Oid, String>::default();
+    let mut record = None;
+    let mut line_offset = 0;
+
+    // Source text may contain NULs and git headers; only complete SHA headers at line starts frame records.
+    for line in output.split_inclusive(|byte| *byte == b'\n') {
+        if let Some((sha, header_length)) = line_history_record_header(line) {
+            if let Some((previous_sha, payload_start)) =
+                record.replace((sha, line_offset + header_length))
+            {
+                let payload = output
+                    .get(payload_start..line_offset)
+                    .context("invalid line history payload range")?;
+                patches
+                    .entry(previous_sha)
+                    .or_default()
+                    .push_str(&decode_line_history_patch(payload));
+            } else {
+                anyhow::ensure!(line_offset == 0, "invalid line history record separator");
+            }
+        } else {
+            anyhow::ensure!(record.is_some(), "invalid line history record header");
+        }
+        line_offset += line.len();
+    }
+
+    if let Some((sha, payload_start)) = record {
+        let payload = output
+            .get(payload_start..)
+            .context("invalid line history payload range")?;
+        patches
+            .entry(sha)
+            .or_default()
+            .push_str(&decode_line_history_patch(payload));
+    }
+    Ok(patches)
+}
+
+fn line_history_record_header(line: &[u8]) -> Option<(Oid, usize)> {
+    let line = line.strip_prefix(b"\0")?;
+    for sha_length in [SHA1_HEX_LENGTH, SHA256_HEX_LENGTH] {
+        if line.get(sha_length) != Some(&0) {
+            continue;
+        }
+        let sha = line.get(..sha_length)?;
+        if sha.iter().all(u8::is_ascii_hexdigit) {
+            return Some((std::str::from_utf8(sha).ok()?.parse().ok()?, sha_length + 2));
+        }
+    }
+    None
+}
+
+fn decode_line_history_patch(payload: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(payload) {
+        return text.to_owned();
+    }
+    match decode_text(payload.to_vec()) {
+        Ok(decoded) => decoded.text,
+        Err(_) => format!(
+            "Binary history patch (lossy text preview)\n\n{}",
+            String::from_utf8_lossy(payload)
+        ),
+    }
 }
 
 fn parse_initial_graph_output<'a>(
@@ -5492,7 +5640,7 @@ mod tests {
             LogSource::Branch("docs/rewrite".into()),
             LogSource::Sha(Oid::from_str("0000000000000000000000000000000000000000").unwrap()),
         ] {
-            let args = source.get_args();
+            let args = source.get_args().unwrap();
             assert_eq!(
                 args.last().map(|arg| arg.as_ref()),
                 Some("--"),
@@ -5501,12 +5649,436 @@ mod tests {
         }
 
         let path_source = LogSource::Path(RepoPath::new("docs/rewrite").unwrap());
-        let path_args = path_source.get_args();
+        let path_args = path_source.get_args().unwrap();
         assert_eq!(
             path_args.iter().filter(|arg| arg.as_ref() == "--").count(),
             1,
             "Path states the separator itself and must not gain a second one"
         );
+    }
+
+    #[test]
+    fn test_line_history_log_source_args() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let mut target = LineHistoryTarget {
+            path: RepoPath::new("directory with spaces/file name.rs").unwrap(),
+            revision: revision.parse().unwrap(),
+            line: 42,
+        };
+        let source = LogSource::Line(target.clone());
+        assert_eq!(
+            source.get_args().unwrap(),
+            [
+                "--no-patch",
+                "-L",
+                "42,42:directory with spaces/file name.rs",
+                revision,
+                "--",
+            ]
+            .map(Cow::Borrowed)
+        );
+
+        target.line = 0;
+        assert!(LogSource::Line(target).get_args().is_err());
+    }
+
+    #[test]
+    fn test_parse_line_history_patches_preserves_and_merges_records() {
+        let root = "0123456789abcdef0123456789abcdef01234567";
+        let changed = "89abcdef0123456789abcdef0123456789abcdef";
+        let changed_patch = format!(
+            "\n\ndiff --git a/old name.rs b/old name.rs\n\
+             --- a/old name.rs\n+++ b/old name.rs\n@@ -12,1 +14,4 @@\n\
+             -old\n+commit {root}\n+diff --git a/fake b/fake\n\
+             +--- a/fake\n+@@ -1,1 +1,1 @@\n"
+        );
+        let root_patch = "\n\ndiff --git a/old name.rs b/old name.rs\n\
+                          new file mode 100644\n--- /dev/null\n+++ b/old name.rs\n\
+                          @@ -0,0 +12,1 @@\n+old\n";
+        let other_patch = "\n\ndiff --git a/another.rs b/another.rs\n\
+                           --- a/another.rs\n+++ b/another.rs\n\
+                           @@ -4,1 +6,1 @@\n-before\n+after\n";
+        let output =
+            format!("\0{changed}\0{changed_patch}\0{root}\0{root_patch}\0{changed}\0{other_patch}");
+
+        assert_eq!(
+            parse_line_history_patches(output.as_bytes()).unwrap(),
+            HashMap::from_iter([
+                (changed.parse().unwrap(), changed_patch + other_patch),
+                (root.parse().unwrap(), root_patch.to_owned()),
+            ])
+        );
+        assert!(parse_line_history_patches(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_history_patches_rejects_malformed_records() {
+        for output in [
+            "unexpected output",
+            "\0not-a-sha\0patch",
+            concat!("\0", "0000000000000000000000000000000000000000"),
+        ] {
+            assert!(
+                parse_line_history_patches(output.as_bytes()).is_err(),
+                "{output:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_line_history_tracks_fixed_revision_across_moves(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let directory = repo_dir.path();
+        git_init_repo(directory);
+
+        fs::write(
+            directory.join("old name.txt"),
+            "before\ntracked original\nafter\n",
+        )
+        .unwrap();
+        git_command(directory, ["add", "."]);
+        git_command(directory, ["commit", "-m", "tracked root"]);
+        let root: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        fs::write(
+            directory.join("old name.txt"),
+            "before\ntracked changed\nafter\n",
+        )
+        .unwrap();
+        git_command(directory, ["commit", "-am", "tracked edit"]);
+        let changed: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        git_command(directory, ["mv", "old name.txt", "file with spaces.txt"]);
+        let path = directory.join("file with spaces.txt");
+        fs::write(&path, "inserted\nbefore\ntracked changed\nafter\n").unwrap();
+        git_command(directory, ["commit", "-am", "tracked move"]);
+        fs::write(
+            &path,
+            "inserted\nbefore changed\ntracked changed\nafter changed\n",
+        )
+        .unwrap();
+        git_command(directory, ["commit", "-am", "tracked adjacent only"]);
+        let revision = git_command_output(directory, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let target = LineHistoryTarget {
+            path: RepoPath::new("file with spaces.txt").unwrap(),
+            revision,
+            line: 3,
+        };
+        let repository = RealGitRepository::new(
+            &directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let patches = repository
+            .line_history_patches(target.clone())
+            .await
+            .unwrap();
+        assert_eq!(patches.len(), 2);
+        let root_patch = patches.get(&root).unwrap();
+        assert!(root_patch.contains("--- /dev/null\n"));
+        assert!(root_patch.contains("@@ -0,0 +2,1 @@\n+tracked original\n"));
+        let changed_patch = patches.get(&changed).unwrap();
+        assert!(changed_patch.contains("diff --git a/old name.txt b/old name.txt\n"));
+        assert!(changed_patch.contains("@@ -2,1 +2,1 @@\n-tracked original\n+tracked changed\n"));
+
+        for iteration in 0..2 {
+            let (request_tx, request_rx) = async_channel::unbounded();
+            repository
+                .initial_graph_data(
+                    LogSource::Line(target.clone()),
+                    LogOrder::DateOrder,
+                    request_tx,
+                )
+                .await
+                .unwrap();
+            let graph = request_rx.recv().await.unwrap();
+            assert_eq!(
+                graph.iter().map(|commit| commit.sha).collect::<Vec<_>>(),
+                [changed, root]
+            );
+            assert!(graph.last().unwrap().parents.is_empty());
+
+            for (query, case_sensitive, expected) in [
+                ("tracked".to_owned(), false, vec![changed, root]),
+                ("edit".to_owned(), true, vec![changed]),
+                ("ROOT".to_owned(), false, vec![root]),
+                ("ROOT".to_owned(), true, vec![]),
+                ("no matching message".to_owned(), false, vec![]),
+                (root.to_string(), false, vec![root]),
+            ] {
+                let (request_tx, request_rx) = async_channel::unbounded();
+                repository
+                    .search_commits(
+                        LogSource::Line(target.clone()),
+                        SearchCommitArgs {
+                            query: query.into(),
+                            case_sensitive,
+                        },
+                        request_tx,
+                    )
+                    .await
+                    .unwrap();
+                let mut commits = Vec::new();
+                while let Ok(commit) = request_rx.try_recv() {
+                    commits.push(commit);
+                }
+                assert_eq!(commits, expected);
+            }
+            assert_eq!(
+                repository
+                    .line_history_patches(target.clone())
+                    .await
+                    .unwrap(),
+                patches
+            );
+            if iteration == 0 {
+                fs::write(
+                    &path,
+                    "inserted\nbefore changed\ntracked future\nafter changed\n",
+                )
+                .unwrap();
+                git_command(directory, ["commit", "-am", "tracked future"]);
+            }
+        }
+
+        let invalid_target = LineHistoryTarget {
+            line: 100,
+            ..target
+        };
+        assert!(
+            repository
+                .line_history_patches(invalid_target.clone())
+                .await
+                .is_err()
+        );
+        let (request_tx, _) = async_channel::unbounded();
+        assert!(
+            repository
+                .initial_graph_data(
+                    LogSource::Line(invalid_target.clone()),
+                    LogOrder::DateOrder,
+                    request_tx,
+                )
+                .await
+                .is_err()
+        );
+        let (request_tx, _) = async_channel::unbounded();
+        assert!(
+            repository
+                .search_commits(
+                    LogSource::Line(invalid_target),
+                    SearchCommitArgs {
+                        query: "tracked".into(),
+                        case_sensitive: false
+                    },
+                    request_tx,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_line_history_patches_preserves_payload_nuls() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let payload = format!(
+            "\n\ndiff --git a/file b/file\n@@ -1,1 +1,4 @@\n\
+             -old\n+tracked\0history\n+embedded\0{sha1}\0header\n\
+             +\0{sha256}\0source\n\0short-sha\0still payload\n"
+        );
+        let other_payload = "\n\ndiff --git a/other b/other\n+other\n";
+        let output = format!("\0{sha1}\0{payload}\0{sha256}\0{other_payload}");
+        assert_eq!(
+            parse_line_history_patches(output.as_bytes()).unwrap(),
+            HashMap::from_iter([
+                (sha1.parse().unwrap(), payload),
+                (sha256.parse().unwrap(), other_payload.to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_line_history_patches_binary_preview_keeps_other_records() {
+        let binary_sha = "0123456789abcdef0123456789abcdef01234567";
+        let text_sha = "89abcdef0123456789abcdef0123456789abcdef";
+        let mut output = format!("\0{binary_sha}\0").into_bytes();
+        output.extend_from_slice(b"\x89PNG\r\n\x1a\n\xff\0binary payload\n");
+        let text_payload = "\n\ndiff --git a/file b/file\n+readable text\n";
+        output.extend_from_slice(format!("\0{text_sha}\0{text_payload}").as_bytes());
+        let patches = parse_line_history_patches(&output).unwrap();
+        assert_eq!(patches.len(), 2);
+        let binary_patch = patches.get(&binary_sha.parse().unwrap()).unwrap();
+        assert!(binary_patch.starts_with("Binary history patch (lossy text preview)\n"));
+        assert!(binary_patch.contains('\u{fffd}'));
+        assert!(binary_patch.contains("\0binary payload"));
+        assert_eq!(
+            patches.get(&text_sha.parse().unwrap()).unwrap(),
+            text_payload
+        );
+    }
+
+    #[gpui::test]
+    async fn test_line_history_patches_decode_legacy_text(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let directory = repo_dir.path();
+        git_init_repo(directory);
+        let path = directory.join("file.txt");
+        fs::write(
+            &path,
+            b"Le caf\xe9 co\xfbte d\xe9j\xe0 10 \x80 : \x93voil\xe0 l'\xe9t\xe9 fran\xe7ais\x94.\n",
+        )
+        .unwrap();
+        git_command(directory, ["add", "."]);
+        git_command(directory, ["commit", "-m", "legacy CP1252 text"]);
+        let root: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        fs::write(&path, "current readable text\n").unwrap();
+        git_command(directory, ["commit", "-am", "current UTF-8 text"]);
+        let revision: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let repository = RealGitRepository::new(
+            &directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let patches = repository
+            .line_history_patches(LineHistoryTarget {
+                path: RepoPath::new("file.txt").unwrap(),
+                revision,
+                line: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(patches.len(), 2);
+        assert!(
+            patches
+                .get(&root)
+                .unwrap()
+                .contains("+Le café coûte déjà 10 €")
+        );
+        let current_patch = patches.get(&revision).unwrap();
+        assert!(current_patch.contains("-Le café coûte déjà 10 €"));
+        assert!(current_patch.contains("+current readable text\n"));
+    }
+
+    #[gpui::test]
+    async fn test_line_history_patches_preserve_historical_nuls(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        for force_text_diff in [false, true] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let directory = repo_dir.path();
+            git_init_repo(directory);
+            if force_text_diff {
+                fs::write(directory.join(".gitattributes"), "file.txt diff\n").unwrap();
+            }
+            let path = directory.join("file.txt");
+            fs::write(&path, b"before\ntracked\0history\nafter\n").unwrap();
+            git_command(directory, ["add", "."]);
+            git_command(directory, ["commit", "-m", "historical NUL"]);
+            fs::write(&path, "before\ntracked current\nafter\n").unwrap();
+            git_command(directory, ["commit", "-am", "current text without NUL"]);
+            let revision = git_command_output(directory, ["rev-parse", "HEAD"])
+                .parse()
+                .unwrap();
+            let repository = RealGitRepository::new(
+                &directory.join(".git"),
+                None,
+                Some("git".into()),
+                cx.executor(),
+            )
+            .unwrap();
+            let patches = repository
+                .line_history_patches(LineHistoryTarget {
+                    path: RepoPath::new("file.txt").unwrap(),
+                    revision,
+                    line: 2,
+                })
+                .await
+                .unwrap();
+            assert_eq!(patches.len(), 2);
+            for patch in patches.values() {
+                if force_text_diff {
+                    assert!(patch.contains("tracked\0history"));
+                } else {
+                    assert!(patch.contains("Binary files"));
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn test_line_history_streams_cancel_when_receivers_close(cx: &mut TestAppContext) {
+        use std::io::Write as _;
+
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let directory = repo_dir.path();
+        git_init_repo(directory);
+        // Both log formats exceed pipe capacity, so waiting without draining stdout cannot finish.
+        let history =
+            b"commit refs/heads/main\ncommitter test <test@zed.dev> 1 +0000\ndata 5\ntest\n\n"
+                .repeat(GRAPH_CHUNK_SIZE * 40);
+        let mut importer = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(directory)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        importer.stdin.take().unwrap().write_all(&history).unwrap();
+        let output = importer.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let repository = RealGitRepository::new(
+            &directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let (request_tx, request_rx) = async_channel::unbounded();
+        drop(request_rx);
+        repository
+            .initial_graph_data(LogSource::All, LogOrder::DateOrder, request_tx)
+            .await
+            .unwrap();
+        let (request_tx, request_rx) = async_channel::unbounded();
+        drop(request_rx);
+        repository
+            .search_commits(
+                LogSource::All,
+                SearchCommitArgs {
+                    query: "test".into(),
+                    case_sensitive: true,
+                },
+                request_tx,
+            )
+            .await
+            .unwrap();
     }
 
     #[gpui::test]

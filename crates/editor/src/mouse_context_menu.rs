@@ -217,6 +217,10 @@ pub fn deploy_context_menu(
                         .is_some()
                 });
 
+        let can_view_line_history = has_git_repo
+            && project.read(cx).git_store().read(cx).is_local()
+            && editor.line_history_buffer(&display_map).is_ok();
+
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
         let format_selections = window.is_action_available(&FormatSelections, cx);
@@ -325,6 +329,11 @@ pub fn deploy_context_menu(
                     !has_git_repo,
                     "View File History",
                     Box::new(git::FileHistory),
+                )
+                .action_disabled_when(
+                    !can_view_line_history,
+                    "View Line History",
+                    Box::new(git::LineHistory),
                 );
             match focus {
                 Some(focus) => builder.context(focus),

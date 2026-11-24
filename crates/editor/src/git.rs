@@ -2,9 +2,13 @@ pub(super) mod blame;
 
 use super::*;
 use ::git::{
-    Oid, Restore, blame::BlameEntry, commit::ParsedCommitMessage, repository::RepoPath,
+    Oid, Restore,
+    blame::BlameEntry,
+    commit::ParsedCommitMessage,
+    repository::{LineHistoryTarget, RepoPath},
     status::FileStatus,
 };
+use anyhow::Context as _;
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::git_store::Repository;
 
@@ -2832,6 +2836,101 @@ impl Editor {
             })
     }
 
+    pub(super) fn line_history_buffer<'a>(
+        &self,
+        snapshot: &'a DisplaySnapshot,
+    ) -> Result<(&'a language::BufferSnapshot, u32)> {
+        if self.selections.count() != 1 {
+            bail!("Place a single cursor on a line to view its history.");
+        }
+        let selections = self.selections.all::<MultiBufferOffset>(snapshot);
+        let [selection] = selections.as_slice() else {
+            bail!("Place a single cursor on a line to view its history.");
+        };
+        if self.selections.line_mode() || !selection.is_empty() {
+            bail!("Clear the selection and place the cursor on a line to view its history.");
+        }
+
+        let snapshot = snapshot.buffer_snapshot();
+        if snapshot.excerpts().count() != 1 {
+            bail!("Open this file in its own editor to view line history.");
+        }
+        let mut ranges = snapshot.range_to_buffer_ranges_with_deleted_hunks(selection.range());
+        let (buffer, range, deleted_hunk) = ranges
+            .next()
+            .context("Place the cursor on a file's text to view line history.")?;
+        if deleted_hunk.is_some()
+            || ranges.next().is_some()
+            || snapshot
+                .diff_for_buffer_id(buffer.remote_id())
+                .is_some_and(|diff| diff.buffer_id() != buffer.remote_id())
+        {
+            bail!("Place the cursor on the current file's text to view line history.");
+        }
+        if buffer
+            .file()
+            .is_some_and(|file| matches!(file.disk_state(), language::DiskState::Historic { .. }))
+        {
+            bail!("Open the current version of this file to view line history.");
+        }
+
+        Ok((buffer, buffer.offset_to_point(range.start.0).row))
+    }
+
+    pub fn line_history_target(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Entity<Repository>, LineHistoryTarget)>> {
+        let target = (|| {
+            let snapshot = self.display_snapshot(cx);
+            let (buffer, row) = self.line_history_buffer(&snapshot)?;
+            let project = self
+                .project()
+                .context("Line history is only available for files in a Git repository.")?;
+            let git_store = project.read(cx).git_store().read(cx);
+            if !git_store.is_local() {
+                bail!("Line history is only available for local Git repositories.");
+            }
+            let (repository, path) = git_store
+                .repository_and_path_for_buffer_id(buffer.remote_id(), cx)
+                .context("Line history is only available for files in a Git repository.")?;
+            anyhow::Ok((repository, path, buffer.clone(), row))
+        })();
+        let (repository, path, buffer, row) = match target {
+            Ok(target) => target,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        let head_sha = repository.update(cx, |repository, _| repository.head_sha());
+        cx.spawn(async move |_, cx| {
+            let head_sha = head_sha
+                .await
+                .context("Could not read HEAD for line history.")?
+                .context("Could not read HEAD for line history.")?
+                .context("Line history is not available until this repository has a commit.")?;
+            let revision = Oid::try_from(head_sha.as_str())
+                .context("Could not read a valid HEAD commit for line history.")?;
+            let head_text = repository
+                .update(cx, |repository, cx| {
+                    repository.line_history_base_text(path.clone(), revision, cx)
+                })
+                .await?;
+            let line = cx
+                .background_spawn(
+                    async move { line_history_head_line(&head_text, &buffer.text(), row) },
+                )
+                .await?;
+            Ok((
+                repository,
+                LineHistoryTarget {
+                    path,
+                    revision,
+                    line,
+                },
+            ))
+        })
+    }
+
     fn get_permalink_to_line(&self, cx: &mut Context<Self>) -> Task<Result<url::Url>> {
         let buffer_and_selection = maybe!({
             let selection = self.selections.newest::<Point>(&self.display_snapshot(cx));
@@ -2875,6 +2974,384 @@ impl Editor {
         project.update(cx, |project, cx| {
             project.get_permalink_to_line(&buffer, selection, cx)
         })
+    }
+}
+
+fn line_history_head_line(head_text: &str, current_text: &str, current_row: u32) -> Result<u32> {
+    // Git counts only LF separators; normalizing a standalone CR would change its line numbers.
+    if head_text
+        .split('\r')
+        .skip(1)
+        .any(|following| !following.starts_with('\n'))
+    {
+        bail!(
+            "Line history is unavailable because the committed file contains standalone CR line endings. Convert it to LF or CRLF and commit the change."
+        );
+    }
+    let head_text = text::LineEnding::normalize_cow(head_text.into());
+    let current_line = current_text
+        .split_inclusive('\n')
+        .nth(current_row as usize)
+        .context("Line history is not available for an empty file or the empty line after a final newline.")?;
+
+    let mut head_end = 0;
+    let mut current_end = 0;
+    for (head_rows, current_rows) in language::line_diff(&head_text, current_text) {
+        if current_rows.contains(&current_row) {
+            bail!("This line has uncommitted changes. Commit or revert them to view its history.");
+        }
+        if current_rows.start > current_row {
+            break;
+        }
+        head_end = head_rows.end;
+        current_end = current_rows.end;
+    }
+
+    // An empty new range deletes lines before the cursor, including at its exact boundary.
+    let unchanged_rows = current_row
+        .checked_sub(current_end)
+        .context("Could not map this line to the HEAD commit.")?;
+    let head_row = head_end
+        .checked_add(unchanged_rows)
+        .context("Could not map this line to the HEAD commit.")?;
+    if head_text.split_inclusive('\n').nth(head_row as usize) != Some(current_line) {
+        bail!("This line has uncommitted changes. Commit or revert them to view its history.");
+    }
+    head_row
+        .checked_add(1)
+        .context("Could not map this line to the HEAD commit.")
+}
+
+#[cfg(test)]
+mod line_history_tests {
+    use super::*;
+    use crate::{editor_tests::init_test, test::editor_test_context::EditorTestContext};
+
+    #[test]
+    fn maps_unchanged_lines_to_git_line_numbers() {
+        assert_eq!(
+            line_history_head_line("alpha\nbeta\n", "alpha\nbeta\n", 0).unwrap(),
+            1
+        );
+        assert_eq!(
+            line_history_head_line("alpha\nbeta", "alpha\nbeta", 1).unwrap(),
+            2
+        );
+        assert_eq!(line_history_head_line("\n", "\n", 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_standalone_carriage_returns_in_head() {
+        for head_text in [
+            "a\rb\nc\n",
+            "\ra\nb\n",
+            "a\nb\r",
+            "a\r\r\nb\n",
+            "a\r\nb\rc\n",
+            "a\nb\nc\r",
+        ] {
+            let mut current_text = head_text.to_string();
+            text::LineEnding::normalize(&mut current_text);
+            let error = line_history_head_line(head_text, &current_text, 1).unwrap_err();
+            assert!(
+                error.to_string().contains("standalone CR"),
+                "{head_text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_crlf_head_to_normalized_buffer_lines() {
+        assert_eq!(
+            line_history_head_line("a\r\nb\r\nc\r\n", "a\nb\nc\n", 1).unwrap(),
+            2
+        );
+        assert_eq!(
+            line_history_head_line("a\r\nb\nc\r\n", "a\nb\nc\n", 1).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn maps_past_insertions_and_allows_later_changes() {
+        let head = "alpha\nbeta\ngamma\ndelta\n";
+        let current = "inserted\nalpha\nbeta\ngamma\nchanged\n";
+        assert_eq!(line_history_head_line(head, current, 1).unwrap(), 1);
+        assert_eq!(line_history_head_line(head, current, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn maps_past_multiple_insertions_and_deletions() {
+        let head = "removed\nalpha\nbeta\ngamma\ndelta\n";
+        let current = "alpha\ninserted\nbeta\ngamma\nchanged\n";
+        assert_eq!(line_history_head_line(head, current, 0).unwrap(), 2);
+        assert_eq!(line_history_head_line(head, current, 2).unwrap(), 3);
+        assert_eq!(line_history_head_line(head, current, 3).unwrap(), 4);
+    }
+
+    #[test]
+    fn maps_lines_on_both_sides_of_a_deletion() {
+        let head = "alpha\nremoved\nalso removed\nbeta\ngamma\n";
+        let current = "alpha\nbeta\ngamma\n";
+        assert_eq!(line_history_head_line(head, current, 0).unwrap(), 1);
+        assert_eq!(line_history_head_line(head, current, 1).unwrap(), 4);
+        assert_eq!(line_history_head_line(head, current, 2).unwrap(), 5);
+        assert_eq!(
+            line_history_head_line("removed\nalpha\n", "alpha\n", 0).unwrap(),
+            2
+        );
+        assert_eq!(
+            line_history_head_line("alpha\nremoved\n", "alpha\n", 0).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_added_and_replaced_lines() {
+        assert!(line_history_head_line("alpha\n", "added\nalpha\n", 0).is_err());
+        assert!(line_history_head_line("alpha\n", "alpha\nadded\n", 1).is_err());
+        assert!(line_history_head_line("alpha\nbeta\n", "alpha\nchanged\n", 1).is_err());
+        let head = "alpha\nbeta\ngamma\ndelta\n";
+        let current = "alpha\nchanged beta\nchanged gamma\ndelta\n";
+        assert!(line_history_head_line(head, current, 1).is_err());
+        assert!(line_history_head_line(head, current, 2).is_err());
+        assert_eq!(line_history_head_line(head, current, 3).unwrap(), 4);
+    }
+
+    #[test]
+    fn checks_the_entire_line_including_its_ending() {
+        assert!(line_history_head_line("alpha\nbeta\n", "alpha\nbeta", 1).is_err());
+        assert!(line_history_head_line("alpha\nbeta", "alpha\nbeta\n", 1).is_err());
+        assert!(line_history_head_line("alpha beta\n", "alpha changed\n", 0).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_files_and_virtual_final_lines() {
+        assert!(line_history_head_line("", "", 0).is_err());
+        assert!(line_history_head_line("alpha\n", "", 0).is_err());
+        assert!(line_history_head_line("", "added\n", 0).is_err());
+        assert!(line_history_head_line("alpha\n", "alpha\n", 1).is_err());
+        assert!(line_history_head_line("\n", "\n", 1).is_err());
+        assert!(line_history_head_line("alpha", "alpha", 1).is_err());
+    }
+
+    #[gpui::test]
+    async fn requires_a_single_empty_selection(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("alˇpha\nbeta\n");
+        let captured = cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, row) = editor.line_history_buffer(&snapshot).unwrap();
+            assert_eq!(row, 0);
+            buffer.clone()
+        });
+
+        cx.set_state("ˇalpha\nˇbeta\n");
+        cx.update_editor(|editor, _, cx| {
+            assert!(
+                editor
+                    .line_history_buffer(&editor.display_snapshot(cx))
+                    .is_err()
+            );
+        });
+        cx.set_state("«alphaˇ»\nbeta\n");
+        cx.update_editor(|editor, _, cx| {
+            assert!(
+                editor
+                    .line_history_buffer(&editor.display_snapshot(cx))
+                    .is_err()
+            );
+        });
+        cx.set_state("alˇpha\nbeta\n");
+        cx.update_editor(|editor, _, cx| {
+            editor.selections.set_line_mode(true);
+            assert!(
+                editor
+                    .line_history_buffer(&editor.display_snapshot(cx))
+                    .is_err()
+            );
+            editor.selections.set_line_mode(false);
+        });
+        cx.set_state("unsaved\nalpha\nbeˇta\n");
+        assert_eq!(captured.text(), "alpha\nbeta\n");
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, row) = editor.line_history_buffer(&snapshot).unwrap();
+            assert_eq!(row, 2);
+            assert_eq!(
+                line_history_head_line(&captured.text(), &buffer.text(), row).unwrap(),
+                2
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn resolves_captured_unsaved_text_against_head_instead_of_index(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇalpha\nbeta\ngamma\ndelta\n");
+        let (fs, dot_git_path) = cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, _) = editor.line_history_buffer(&snapshot).unwrap();
+            let project = editor.project().unwrap().read(cx);
+            let (repository, _) = project
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_buffer_id(buffer.remote_id(), cx)
+                .unwrap();
+            (
+                project.fs().as_fake(),
+                repository.read(cx).dot_git_abs_path.clone(),
+            )
+        });
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        fs.set_head_for_repo(
+            &dot_git_path,
+            &[("file", "alpha\r\nbeta\r\ngamma\r\ndelta\r\n".to_string())],
+            head_sha,
+        );
+        cx.set_index_text("staged\nalpha\nbeta\ngamma\ndelta\n");
+        cx.set_state("staged\nalpha\nsaved\nbeˇta\ngamma\ndelta\n");
+        cx.update_editor(|editor, _, cx| {
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap();
+            editor
+                .project()
+                .unwrap()
+                .update(cx, |project, cx| project.save_buffer(buffer, cx))
+        })
+        .await
+        .unwrap();
+        cx.set_state("staged\nalpha\nsaved\nbeˇta\nunsaved\ngamma\nchanged\n");
+        cx.update_buffer(|buffer, _| assert!(buffer.is_dirty()));
+        let task = cx.update_editor(|editor, _, cx| editor.line_history_target(cx));
+        cx.set_state("ˇedited after requesting history\n");
+
+        let (_, target) = task.await.unwrap();
+        assert_eq!(target.path.as_unix_str(), "file");
+        assert_eq!(target.revision.to_string(), head_sha);
+        assert_eq!(target.line, 2);
+        fs.with_git_state(&dot_git_path, false, |state| {
+            assert!(
+                state
+                    .load_revisions_calls
+                    .iter()
+                    .any(|revisions| { revisions.as_slice() == [format!("{head_sha}:file")] })
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn rejects_standalone_cr_in_raw_head_and_accepts_crlf(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("a\rˇb\nc\n");
+        let (fs, dot_git_path) = cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, row) = editor.line_history_buffer(&snapshot).unwrap();
+            assert_eq!(buffer.text(), "a\nb\nc\n");
+            assert_eq!(row, 1);
+            let project = editor.project().unwrap().read(cx);
+            let (repository, _) = project
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_buffer_id(buffer.remote_id(), cx)
+                .unwrap();
+            (
+                project.fs().as_fake(),
+                repository.read(cx).dot_git_abs_path.clone(),
+            )
+        });
+        fs.set_head_for_repo(
+            &dot_git_path,
+            &[("file", "a\rb\nc\n".to_string())],
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let error = cx
+            .update_editor(|editor, _, cx| editor.line_history_target(cx))
+            .await
+            .err()
+            .expect("Line history must reject standalone CRs in the committed file");
+        assert!(error.to_string().contains("standalone CR"), "{error}");
+
+        let head_sha = "abcdef0123456789abcdef0123456789abcdef01";
+        fs.set_head_for_repo(
+            &dot_git_path,
+            &[("file", "a\r\nb\r\nc\r\n".to_string())],
+            head_sha,
+        );
+        let (_, target) = cx
+            .update_editor(|editor, _, cx| editor.line_history_target(cx))
+            .await
+            .unwrap();
+        assert_eq!(target.path.as_unix_str(), "file");
+        assert_eq!(target.revision.to_string(), head_sha);
+        assert_eq!(target.line, 2);
+    }
+
+    #[gpui::test]
+    fn maps_an_excerpt_to_the_full_buffer(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new_multibuffer(cx, ["before\n«alpha\nbeta\n»after\n"]);
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 0)]);
+            });
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, row) = editor.line_history_buffer(&snapshot).unwrap();
+            assert_eq!(row, 2);
+            assert_eq!(buffer.text(), "before\nalpha\nbeta\nafter\n");
+        });
+    }
+
+    #[gpui::test]
+    fn requires_one_excerpt(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new_multibuffer(cx, ["«alpha\n»", "«beta\n»"]);
+        cx.update_editor(|editor, _, cx| {
+            assert!(
+                editor
+                    .line_history_buffer(&editor.display_snapshot(cx))
+                    .is_err()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn rejects_deleted_diff_text(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇalpha\nbeta\n");
+        cx.set_head_text("alpha\nremoved\nbeta\n");
+        cx.update_editor(|editor, window, cx| {
+            editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 0)]);
+            });
+            assert!(
+                editor
+                    .line_history_buffer(&editor.display_snapshot(cx))
+                    .is_err()
+            );
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(2, 0)..Point::new(2, 0)]);
+            });
+            let snapshot = editor.display_snapshot(cx);
+            let (buffer, row) = editor.line_history_buffer(&snapshot).unwrap();
+            assert_eq!(row, 1);
+            assert_eq!(buffer.text(), "alpha\nbeta\n");
+            assert_eq!(
+                line_history_head_line("alpha\nremoved\nbeta\n", &buffer.text(), row).unwrap(),
+                3
+            );
+        });
     }
 }
 

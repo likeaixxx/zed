@@ -40,9 +40,9 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-        Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        GitCommitTemplate, GitRepository, InitialGraphCommitData, LineHistoryTarget, LogOrder,
+        LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -4261,8 +4261,6 @@ impl GitStore {
         envelope: TypedEnvelope<proto::SearchCommits>,
         mut cx: AsyncApp,
     ) -> Result<impl Stream<Item = Result<proto::SearchCommitsResponse>>> {
-        const CHUNK_SIZE: usize = 100;
-
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
         let log_source = log_source_from_proto(
@@ -4277,12 +4275,25 @@ impl GitStore {
         };
 
         let (request_tx, request_rx) = async_channel::unbounded();
-        repository_handle.update(&mut cx, |repository, cx| {
-            repository.search_commits(log_source, search_args, request_tx, cx);
+        let search_task = repository_handle.update(&mut cx, |repository, cx| {
+            repository.search_commits(log_source, search_args, request_tx, cx)
         });
+        Ok(Self::stream_search_commit_responses(
+            search_task,
+            request_rx,
+            cx,
+        ))
+    }
+
+    fn stream_search_commit_responses(
+        search_task: Task<Result<()>>,
+        request_rx: async_channel::Receiver<Oid>,
+        cx: AsyncApp,
+    ) -> impl Stream<Item = Result<proto::SearchCommitsResponse>> {
+        const CHUNK_SIZE: usize = 100;
 
         let (mut response_tx, response_rx) = mpsc::unbounded();
-        cx.background_spawn(async move {
+        let response_task = cx.background_spawn(async move {
             let mut shas = Vec::new();
 
             while let Ok(sha) = request_rx.recv().await {
@@ -4301,16 +4312,28 @@ impl GitStore {
                 }
             }
 
-            if !shas.is_empty() {
-                response_tx
+            if !shas.is_empty()
+                && response_tx
                     .send(Ok(proto::SearchCommitsResponse { shas }))
                     .await
-                    .ok();
+                    .is_err()
+            {
+                return;
             }
-        })
-        .detach();
+            if let Err(error) = search_task.await {
+                if response_tx.send(Err(error)).await.is_err() {
+                    return;
+                }
+            }
+        });
 
-        Ok(response_rx)
+        futures::stream::unfold(
+            (response_rx, response_task),
+            |(mut responses, task)| async move {
+                let response = responses.next().await?;
+                Some((response, (responses, task)))
+            },
+        )
     }
 
     async fn handle_edit_ref(
@@ -7435,6 +7458,26 @@ impl Repository {
         })
     }
 
+    pub fn line_history_patches(
+        &self,
+        target: LineHistoryTarget,
+        cx: &App,
+    ) -> Task<Result<HashMap<Oid, String>>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = object_read_limiter.acquire_arc().await;
+            match repository_state.await.map_err(|error| anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.line_history_patches(target).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("line history patches are not supported for remote repositories")
+                }
+            }
+        })
+    }
+
     pub fn file_history_changed_files(
         &mut self,
         paths: Vec<RepoPath>,
@@ -7472,23 +7515,19 @@ impl Repository {
         search_args: SearchCommitArgs,
         request_tx: async_channel::Sender<Oid>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<Result<()>> {
         let repository_state = self.repository_state.clone();
         let repository_id = self.id;
 
         cx.background_spawn(async move {
-            let repo_state = repository_state.await;
-
-            match repo_state {
-                Ok(RepositoryState::Local(LocalRepositoryState { backend, .. })) => {
+            match repository_state.await.map_err(|error| anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend
                         .search_commits(log_source, search_args, request_tx)
                         .await
-                        .log_err();
                 }
-
-                Ok(RepositoryState::Remote(RemoteRepositoryState { client, project_id })) => {
-                    let result = client
+                RepositoryState::Remote(RemoteRepositoryState { client, project_id }) => {
+                    let mut stream = client
                         .request_stream(proto::SearchCommits {
                             project_id: project_id.to_proto(),
                             repository_id: repository_id.to_proto(),
@@ -7496,43 +7535,22 @@ impl Repository {
                             query: search_args.query.to_string(),
                             case_sensitive: search_args.case_sensitive,
                         })
-                        .await;
-
-                    let mut stream = match result {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            log::error!("failed to search commits remotely: {error:?}");
-                            return;
-                        }
-                    };
+                        .await?;
 
                     while let Some(response) = stream.next().await {
-                        let response = match response {
-                            Ok(response) => response,
-                            Err(error) => {
-                                log::error!(
-                                    "failed to receive remote commit search results: {error:?}"
-                                );
-                                return;
-                            }
-                        };
-
-                        for sha in &response.shas {
-                            let Ok(oid) = Oid::from_str(sha) else {
-                                return;
-                            };
+                        for sha in response?.shas {
+                            let oid = Oid::from_str(&sha).with_context(|| {
+                                format!("invalid commit SHA in search response: {sha}")
+                            })?;
                             if request_tx.send(oid).await.is_err() {
-                                return;
+                                return Ok(());
                             }
                         }
                     }
+                    Ok(())
                 }
-                Err(error) => {
-                    log::error!("failed to get repository state for commit search: {error}");
-                }
-            };
+            }
         })
-        .detach();
     }
 
     pub fn graph_data(
@@ -10513,6 +10531,38 @@ impl Repository {
         )
     }
 
+    pub fn line_history_base_text(
+        &mut self,
+        path: RepoPath,
+        revision: Oid,
+        cx: &App,
+    ) -> Task<Result<String>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = object_read_limiter.acquire_arc().await;
+            match repository_state.await.map_err(|error| anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let content = backend
+                        .load_revisions(vec![format!("{revision}:{}", path.as_unix_str())])
+                        .await?
+                        .pop()
+                        .flatten()
+                        .with_context(|| {
+                            format!(
+                                "cannot load {:?} at revision {revision}: the file is missing or not a regular file",
+                                path.as_ref()
+                            )
+                        })?;
+                    decode_git_text(content)
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("line history base text is not supported for remote repositories")
+                }
+            }
+        })
+    }
+
     pub fn blame_buffer_at_revision(
         &mut self,
         path: RepoPath,
@@ -11330,6 +11380,13 @@ fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
             LogSource::Path(path) => {
                 proto::git_log_source::Source::Path(path.as_unix_str().to_owned())
             }
+            LogSource::Line(target) => {
+                proto::git_log_source::Source::Line(proto::GitLineHistoryTarget {
+                    path: target.path.as_unix_str().to_owned(),
+                    revision: target.revision.to_string(),
+                    line: target.line,
+                })
+            }
         }),
     }
 }
@@ -11344,6 +11401,17 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         proto::git_log_source::Source::Sha(sha) => Ok(LogSource::Sha(Oid::from_str(&sha)?)),
         proto::git_log_source::Source::Path(path) => {
             Ok(LogSource::Path(RepoPath::from_proto(&path)?))
+        }
+        proto::git_log_source::Source::Line(target) => {
+            anyhow::ensure!(
+                target.line > 0,
+                "line history requires a one-based line number"
+            );
+            Ok(LogSource::Line(LineHistoryTarget {
+                path: RepoPath::from_proto(&target.path)?,
+                revision: Oid::from_str(&target.revision)?,
+                line: target.line,
+            }))
         }
     }
 }
@@ -11622,6 +11690,93 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn test_line_history_search_stream_forwards_failure(cx: &mut TestAppContext) {
+        let sha: Oid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let search_task = cx.executor().spawn(async move {
+            request_tx.send(sha).await?;
+            bail!("expected search failure")
+        });
+        let responses =
+            GitStore::stream_search_commit_responses(search_task, request_rx, cx.to_async());
+        futures::pin_mut!(responses);
+        assert_eq!(
+            responses.next().await.unwrap().unwrap().shas,
+            [sha.to_string()]
+        );
+        assert_eq!(
+            responses.next().await.unwrap().unwrap_err().to_string(),
+            "expected search failure"
+        );
+        assert!(responses.next().await.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_line_history_search_stream_cancels_task_on_drop(cx: &mut TestAppContext) {
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let cancellation = util::defer(move || {
+            cancelled_tx
+                .send(())
+                .expect("cancellation receiver remains alive");
+        });
+        let search_task = cx.executor().spawn(async move {
+            let _cancellation = cancellation;
+            let _request_tx = request_tx;
+            future::pending::<Result<()>>().await
+        });
+        let responses =
+            GitStore::stream_search_commit_responses(search_task, request_rx, cx.to_async());
+        drop(responses);
+        cancelled_rx
+            .await
+            .expect("dropping the response stream must cancel the search task");
+    }
+
+    #[test]
+    fn test_line_history_log_source_proto_round_trip() {
+        let revision = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+        for source in [
+            LogSource::All,
+            LogSource::Branch("main".into()),
+            LogSource::Sha(revision),
+            LogSource::Path(repo_path("directory with spaces/file.rs")),
+            LogSource::Line(LineHistoryTarget {
+                path: repo_path("directory with spaces/file.rs"),
+                revision,
+                line: 42,
+            }),
+        ] {
+            assert_eq!(
+                log_source_from_proto(log_source_to_proto(&source)).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn test_line_history_log_source_proto_rejects_invalid_targets() {
+        for (path, revision, line) in [
+            ("file.rs", "0123456789abcdef0123456789abcdef01234567", 0),
+            ("file.rs", "invalid", 1),
+            ("../file.rs", "0123456789abcdef0123456789abcdef01234567", 1),
+        ] {
+            assert!(
+                log_source_from_proto(proto::GitLogSource {
+                    source: Some(proto::git_log_source::Source::Line(
+                        proto::GitLineHistoryTarget {
+                            path: path.into(),
+                            revision: revision.into(),
+                            line,
+                        }
+                    )),
+                })
+                .is_err()
+            );
+        }
     }
 
     #[gpui::test]
@@ -12260,6 +12415,109 @@ mod tests {
         let repository =
             project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
         (fs, project, repository)
+    }
+
+    #[gpui::test]
+    async fn test_line_history_search_task_propagates_repository_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, _project, repository) = setup_repository(cx, &[]).await;
+        let (request_tx, _request_rx) = async_channel::unbounded();
+        let search_task = repository.update(cx, |repository, cx| {
+            repository.repository_state =
+                Task::ready(Err("expected repository failure".into())).shared();
+            repository.search_commits(
+                LogSource::All,
+                SearchCommitArgs {
+                    query: "test".into(),
+                    case_sensitive: false,
+                },
+                request_tx,
+                cx,
+            )
+        });
+        assert_eq!(
+            search_task.await.unwrap_err().to_string(),
+            "expected repository failure"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_line_history_base_text_uses_fixed_revision(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, _project, repository) =
+            setup_repository(cx, &[("file name.rs", "index text\n".into())]).await;
+        let dot_git = Path::new(util::path!("/project/.git"));
+        let revision: Oid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+        let original = "строка один\nстрока два\n";
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("HEAD".into(), revision.to_string());
+            state.head_contents.insert(
+                repo_path("file name.rs"),
+                encode_text(original.to_owned(), encoding_rs::UTF_16LE, true),
+            );
+            state
+                .head_contents
+                .insert(repo_path("binary"), vec![0; 128]);
+        })
+        .unwrap();
+        let (askpass, _prompts) = test_askpass_delegate(cx);
+        repository
+            .update(cx, |repository, cx| {
+                repository.commit(
+                    "advance HEAD".into(),
+                    None,
+                    CommitOptions::default(),
+                    askpass,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        fs.set_head_for_repo(
+            dot_git,
+            &[("file name.rs", "new HEAD text\n".into())],
+            "89abcdef0123456789abcdef0123456789abcdef",
+        );
+
+        assert_eq!(
+            repository
+                .update(cx, |repository, cx| {
+                    repository.line_history_base_text(repo_path("file name.rs"), revision, cx)
+                })
+                .await
+                .unwrap(),
+            original
+        );
+        for path in ["missing", "binary"] {
+            assert!(
+                repository
+                    .update(cx, |repository, cx| {
+                        repository.line_history_base_text(repo_path(path), revision, cx)
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+        let requested_revision = format!("{revision}:file name.rs");
+        fs.with_git_state(dot_git, false, |state| {
+            assert!(
+                state
+                    .load_revisions_calls
+                    .contains(&vec![requested_revision.clone()])
+            );
+            state
+                .simulated_unreadable_revisions
+                .insert(requested_revision);
+        })
+        .unwrap();
+        let error = repository
+            .update(cx, |repository, cx| {
+                repository.line_history_base_text(repo_path("file name.rs"), revision, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("simulated failure"));
     }
 
     #[gpui::test]

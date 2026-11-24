@@ -754,12 +754,19 @@ message GetCommitDataResponse {
 
 message GitLogSourceAll {}
 
+message GitLineHistoryTarget {
+  string path = 1;
+  string revision = 2;
+  uint32 line = 3;
+}
+
 message GitLogSource {
   oneof source {
     GitLogSourceAll all = 1;
     string branch = 2;
     string sha = 3;
     string path = 4;
+    GitLineHistoryTarget line = 5;
   }
 }
 
