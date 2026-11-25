@@ -77,6 +77,24 @@ pub(crate) fn commit_context_menu(
                     );
                 }
             })
+            .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                menu.when_some(repository.clone(), |menu, repository| {
+                    let workspace = workspace.clone();
+                    menu.entry(
+                        "Show in Git Panel History",
+                        Some(crate::git_panel::ActivateHistoryTab.boxed_clone()),
+                        move |window, cx| {
+                            crate::git_panel::GitPanel::reveal_commit(
+                                sha,
+                                repository.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
+                        },
+                    )
+                })
+            })
             .entry(
                 "Copy SHA",
                 Some(CopyCommitSha.boxed_clone()),

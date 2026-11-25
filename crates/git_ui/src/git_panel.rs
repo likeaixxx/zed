@@ -1362,6 +1362,7 @@ pub struct GitPanel {
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
     active_history_sha: Option<Oid>,
+    pending_history_sha: Option<Oid>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
@@ -1771,6 +1772,7 @@ impl GitPanel {
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
                 active_history_sha: None,
+                pending_history_sha: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
@@ -5843,6 +5845,7 @@ impl GitPanel {
         let active_repository_changed = self.active_repository.as_ref().map(Entity::entity_id)
             != new_active_repository.as_ref().map(Entity::entity_id);
         if active_repository_changed {
+            self.pending_history_sha = None;
             self.clear_marks();
             self.set_skip_hooks_enabled(false, cx);
             if self.amend_pending {
@@ -7928,6 +7931,7 @@ impl GitPanel {
             return;
         }
         self.active_history_sha = active_history_sha;
+        self.pending_history_sha = None;
         if let Some(index) = self.active_history_entry_index() {
             self.focused_history_entry = Some(index);
         }
@@ -7939,6 +7943,7 @@ impl GitPanel {
         if count == 0 {
             return;
         }
+        self.pending_history_sha = None;
         let new_index = match self.focused_history_entry {
             None => 0,
             Some(i) => (i + 1).min(count - 1),
@@ -7955,6 +7960,7 @@ impl GitPanel {
         if count == 0 {
             return;
         }
+        self.pending_history_sha = None;
         let new_index = match self.focused_history_entry {
             None => 0,
             Some(i) => i.saturating_sub(1),
@@ -8012,9 +8018,49 @@ impl GitPanel {
             window,
             cx,
         );
+        self.pending_history_sha = None;
         self.focused_history_entry = Some(index);
         self.history_keyboard_nav = false;
         self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    pub(crate) fn reveal_commit(
+        sha: Oid,
+        repository: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        let Some(panel) = workspace
+            .update(cx, |workspace, cx| {
+                workspace.focus_panel::<GitPanel>(window, cx)
+            })
+            .log_err()
+            .flatten()
+        else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            // Refresh outside the Workspace update: repository changes can read the active item.
+            panel.schedule_update(window, cx);
+            panel.reveal_history_commit(sha, window, cx);
+        });
+    }
+
+    fn reveal_history_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_history_sha = Some(sha);
+        self.focused_history_entry = None;
+        if self.active_tab == GitPanelTab::History {
+            self.load_commit_history(cx);
+        } else {
+            self.activate_history_tab(&ActivateHistoryTab, window, cx);
+        }
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     fn activate_changes_tab(
@@ -8047,6 +8093,7 @@ impl GitPanel {
                 self.load_commit_history(cx);
             }
             GitPanelTab::Changes => {
+                self.pending_history_sha = None;
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
@@ -8110,6 +8157,7 @@ impl GitPanel {
 
         let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
             // No HEAD commit at all (unborn/empty repository).
+            self.pending_history_sha = None;
             self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
         };
@@ -8125,20 +8173,64 @@ impl GitPanel {
             (entries, response.is_loading, response.error)
         });
 
-        self.set_commit_history(commit_history_from_response(entries, is_loading, error), cx);
+        self.set_commit_history(
+            commit_history_from_response(entries, is_loading, error.clone()),
+            cx,
+        );
+        if !is_loading && let Some(sha) = self.pending_history_sha.take() {
+            let message = match error {
+                Some(error) => format!("Unable to load commit history: {error}"),
+                None => format!(
+                    "Commit {} is not in the current branch history",
+                    sha.display_short()
+                ),
+            };
+            let workspace = self.workspace.clone();
+            cx.defer(move |cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        struct HistoryCommitNotFound;
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                NotificationId::unique::<HistoryCommitNotFound>(),
+                                message,
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    })
+                    .log_err();
+            });
+        }
     }
 
     fn set_commit_history(&mut self, commit_history: CommitHistory, cx: &mut Context<Self>) {
         let changed = self.commit_history != commit_history;
         self.commit_history = commit_history;
-        // Keep the focused entry within range as the history grows or clears,
-        // starting from the active commit when nothing is focused yet.
-        let count = self.commit_history_entries().len();
-        let focused = self
-            .focused_history_entry
-            .or_else(|| self.active_history_entry_index());
-        self.focused_history_entry =
-            focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
+        // Keep the requested SHA across streamed batches so an early batch cannot select another commit.
+        if let Some(sha) = self.pending_history_sha {
+            if let Some(index) = self
+                .commit_history_entries()
+                .iter()
+                .position(|entry| entry.sha == sha)
+            {
+                self.pending_history_sha = None;
+                self.focused_history_entry = Some(index);
+                self.history_keyboard_nav = true;
+                self.commit_history_scroll_handle
+                    .scroll_to_item(index, ScrollStrategy::Center);
+                cx.notify();
+            }
+        } else {
+            // Keep the focused entry within range as the history grows or clears,
+            // starting from the active commit when nothing is focused yet.
+            let count = self.commit_history_entries().len();
+            let focused = self
+                .focused_history_entry
+                .or_else(|| self.active_history_entry_index());
+            self.focused_history_entry =
+                focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
+        }
         if changed {
             cx.notify();
         }
@@ -8456,6 +8548,7 @@ impl GitPanel {
                                             move |_, _, cx| {
                                                 git_panel
                                                     .update(cx, |panel, cx| {
+                                                        panel.pending_history_sha = None;
                                                         panel.focused_history_entry = Some(index);
                                                         panel.history_keyboard_nav = false;
                                                         cx.notify();
@@ -11730,6 +11823,68 @@ mod tests {
             });
             self.cx.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_reveals_requested_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut test, [_, middle_sha, _]) = history_panel_with_commits(cx).await;
+        test.panel.update_in(&mut test.cx, |panel, window, cx| {
+            panel.activate_changes_tab(&ActivateChangesTab, window, cx);
+            panel.reveal_history_commit(middle_sha, window, cx);
+        });
+        wait_for_commit_history_to_settle(&test.panel, &mut test.cx).await;
+        test.panel.read_with(&test.cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::History);
+            assert_eq!(panel.focused_history_entry, Some(1));
+            assert!(panel.history_keyboard_nav);
+            assert!(panel.pending_history_sha.is_none());
+            assert!(panel.active_history_sha.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_reveal_waits_for_streamed_entries(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut test, shas) = history_panel_with_commits(cx).await;
+        test.panel.update(&mut test.cx, |panel, cx| {
+            panel.pending_history_sha = Some(shas[1]);
+            panel.focused_history_entry = None;
+            let entries = |shas: &[Oid]| {
+                Rc::from(
+                    shas.iter()
+                        .map(|sha| CommitHistoryEntry {
+                            sha: *sha,
+                            tag_names: Vec::new(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            panel.set_commit_history(CommitHistory::Loaded(entries(&shas[..1])), cx);
+            assert_eq!(panel.pending_history_sha, Some(shas[1]));
+            assert_eq!(panel.focused_history_entry, None);
+            panel.set_commit_history(CommitHistory::Loaded(entries(&shas)), cx);
+            assert_eq!(panel.pending_history_sha, None);
+            assert_eq!(panel.focused_history_entry, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_reveal_missing_commit_does_not_focus_another(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (mut test, _) = history_panel_with_commits(cx).await;
+        let missing_sha = Oid::from_bytes(&[9; 20]).unwrap();
+        test.panel.update_in(&mut test.cx, |panel, window, cx| {
+            panel.reveal_history_commit(missing_sha, window, cx);
+        });
+        test.cx.run_until_parked();
+        test.panel.read_with(&test.cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::History);
+            assert_eq!(panel.focused_history_entry, None);
+            assert_eq!(panel.pending_history_sha, None);
+        });
     }
 
     #[gpui::test]

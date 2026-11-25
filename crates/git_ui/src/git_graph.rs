@@ -2945,6 +2945,7 @@ impl GitGraph {
         if matches!(self.log_source, LogSource::Line(_)) {
             let sha = commit.data.sha;
             let graph = cx.entity();
+            let workspace = self.workspace.clone();
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone())
                     .header(format!("Commit {}", sha.display_short()))
@@ -2957,6 +2958,21 @@ impl GitGraph {
                             });
                         },
                     )
+                    .when_some(repository, |menu, repository| {
+                        menu.entry(
+                            "Show in Git Panel History",
+                            Some(crate::git_panel::ActivateHistoryTab.boxed_clone()),
+                            move |window, cx| {
+                                crate::git_panel::GitPanel::reveal_commit(
+                                    sha,
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )
+                    })
                     .entry(
                         "Copy SHA",
                         Some(CopyCommitSha.boxed_clone()),
@@ -7372,6 +7388,103 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[gpui::test]
+    async fn test_line_history_context_menu_reveals_clicked_commit_in_git_panel(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let root = Path::new(util::path!("/project"));
+        fs.insert_tree(root, json!({ ".git": {}, "file.txt": "first\nsecond\n" }))
+            .await;
+        let shas = [
+            Oid::from_bytes(&[1; 20]).unwrap(),
+            Oid::from_bytes(&[2; 20]).unwrap(),
+        ];
+        fs.with_git_state(&root.join(".git"), true, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), shas[0].to_string());
+            state.graph_commits = vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: shas[0],
+                    parents: smallvec![shas[1]],
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: shas[1],
+                    parents: smallvec![],
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+        let project = Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let panel = workspace.update_in(cx, crate::git_panel::GitPanel::new_test);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx)
+        });
+        for source in [
+            LogSource::Line(LineHistoryTarget {
+                path: RepoPath::new(&"file.txt").unwrap(),
+                revision: shas[0],
+                line: 1,
+            }),
+            LogSource::All,
+        ] {
+            let graph = workspace.update_in(cx, |workspace, window, cx| {
+                let graph = cx.new(|cx| {
+                    GitGraph::new(
+                        repository.read(cx).id,
+                        project.read(cx).git_store().clone(),
+                        workspace.weak_handle(),
+                        Some(source),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item_to_active_pane(Box::new(graph.clone()), None, true, window, cx);
+                graph
+            });
+            cx.run_until_parked();
+            graph.update_in(cx, |graph, window, cx| {
+                assert_eq!(graph.graph_data.commits.len(), 2);
+                graph.selected_commit_sha = Some(shas[0]);
+                graph.deploy_entry_context_menu(point(px(20.), px(20.)), 1, None, window, cx);
+            });
+            let context_menu = graph.read_with(cx, |graph, _| {
+                graph.context_menu.as_ref().unwrap().menu.clone()
+            });
+            context_menu.update_in(cx, |menu, window, cx| {
+                menu.select_first(&menu::SelectFirst, window, cx);
+                menu.select_next(&menu::SelectNext, window, cx);
+                menu.confirm(&menu::Confirm, window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                panel.read_with(cx, |panel, _| panel.commit_history_shas()),
+                shas
+            );
+            cx.dispatch_action(menu::Confirm);
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                let commit_view = workspace
+                    .active_item_as::<CommitView>(cx)
+                    .expect("History should open the focused commit");
+                assert_eq!(
+                    commit_view.read(cx).commit_sha().as_ref(),
+                    shas[1].to_string().as_str()
+                );
+            });
+        }
     }
 
     #[gpui::test]
