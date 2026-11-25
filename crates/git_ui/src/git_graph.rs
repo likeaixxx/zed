@@ -2706,7 +2706,9 @@ impl GitGraph {
         let Some(patches) = self.ensure_line_history_patches(cx) else {
             return;
         };
-        let repository_id = self.repo_id;
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
         let workspace = self.workspace.clone();
         window
             .spawn(cx, {
@@ -2718,13 +2720,7 @@ impl GitGraph {
                     })?;
                     workspace.update_in(cx, |workspace, window, cx| {
                         LineHistoryView::open(
-                            repository_id,
-                            target,
-                            sha,
-                            patch,
-                            workspace,
-                            window,
-                            cx,
+                            repository, target, sha, patch, workspace, window, cx,
                         );
                     })?;
                     anyhow::Ok(())
@@ -3274,19 +3270,24 @@ impl GitGraph {
                         .as_ref()
                         .is_none_or(|view| view.read(cx).sha != sha)
                     {
-                        let project = self.workspace.read_with(cx, |workspace, _| {
-                            workspace.project().clone()
-                        });
-                        let Ok(project) = project else {
+                        let Some(workspace) = self.workspace.upgrade() else {
                             return Empty.into_any_element();
                         };
+                        let Some(repository) = self.get_repository(cx) else {
+                            return Empty.into_any_element();
+                        };
+                        let files = repository.update(cx, |repository, cx| {
+                            repository.line_history_diff(sha, patch.clone(), cx)
+                        });
+                        let project = workspace.read(cx).project().clone();
                         self.line_history.preview = Some(cx.new(|cx| {
                             LineHistoryView::new(
-                                self.repo_id,
+                                repository,
                                 target.clone(),
                                 sha,
-                                patch,
+                                files,
                                 project,
+                                workspace,
                                 window,
                                 cx,
                             )

@@ -3490,6 +3490,7 @@ impl GitRepository for RealGitRepository {
             let mut command = git.build_command(&[
                 "log",
                 "--patch",
+                "--full-index",
                 "--format=%x00%H%x00",
                 "--no-ext-diff",
                 "--no-textconv",
@@ -3717,6 +3718,247 @@ fn parse_file_history_changed_files_output(
     }
 
     histories
+}
+
+#[derive(Debug, Default)]
+pub struct LineHistoryDiffEntry {
+    pub old_path: Option<RepoPath>,
+    pub new_path: Option<RepoPath>,
+    pub old_oid: Option<Oid>,
+    pub new_oid: Option<Oid>,
+    pub ranges: Vec<std::ops::Range<u32>>,
+}
+
+pub fn parse_line_history_patch_ranges(
+    patch: &str,
+) -> Result<HashMap<RepoPath, Vec<std::ops::Range<u32>>>> {
+    let mut files = HashMap::<RepoPath, Vec<std::ops::Range<u32>>>::default();
+    for entry in parse_line_history_diff_entries(patch, false)? {
+        let path = entry
+            .new_path
+            .or(entry.old_path)
+            .context("line history patch has no file path")?;
+        files.entry(path).or_default().extend(entry.ranges);
+    }
+    Ok(files)
+}
+
+pub fn parse_line_history_diff(patch: &str) -> Result<Vec<LineHistoryDiffEntry>> {
+    parse_line_history_diff_entries(patch, true)
+}
+
+fn parse_line_history_diff_entries(
+    patch: &str,
+    require_index: bool,
+) -> Result<Vec<LineHistoryDiffEntry>> {
+    let mut files = Vec::new();
+    let mut entry: Option<LineHistoryDiffEntry> = None;
+    let mut has_index = false;
+    let mut has_old_path = false;
+    let mut has_new_path = false;
+    let mut remaining = (0u32, 0u32);
+
+    for line in patch.split_terminator('\n') {
+        // Consume the declared hunk before interpreting headers: deleted and added source lines
+        // can themselves start with `---`, `+++`, or `diff --git`.
+        if remaining != (0, 0) {
+            let consumed = match line.as_bytes().first() {
+                Some(b' ') => (1, 1),
+                Some(b'-') => (1, 0),
+                Some(b'+') => (0, 1),
+                Some(b'\\') if line == "\\ No newline at end of file" => continue,
+                _ => bail!("invalid line history hunk content"),
+            };
+            remaining.0 = remaining
+                .0
+                .checked_sub(consumed.0)
+                .context("line history old hunk count exceeded")?;
+            remaining.1 = remaining
+                .1
+                .checked_sub(consumed.1)
+                .context("line history new hunk count exceeded")?;
+            continue;
+        }
+        if line.starts_with("diff --git ") {
+            if let Some(entry) = entry.take() {
+                finish_line_history_diff_entry(entry, require_index, has_index, &mut files)?;
+            }
+            entry = Some(LineHistoryDiffEntry::default());
+            has_index = false;
+            has_old_path = false;
+            has_new_path = false;
+            continue;
+        }
+        let Some(entry) = entry.as_mut() else {
+            continue;
+        };
+        if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            bail!("binary line history diffs are not supported");
+        } else if entry.ranges.is_empty()
+            && let Some(index) = line.strip_prefix("index ")
+        {
+            anyhow::ensure!(!has_index, "duplicate line history index header");
+            let (old_oid, new_oid) = index
+                .split_ascii_whitespace()
+                .next()
+                .and_then(|value| value.split_once(".."))
+                .context("invalid line history index header")?;
+            entry.old_oid = parse_line_history_blob_oid(old_oid, require_index)?;
+            entry.new_oid = parse_line_history_blob_oid(new_oid, require_index)?;
+            has_index = true;
+        } else if !has_old_path && let Some(value) = line.strip_prefix("--- ") {
+            entry.old_path = parse_line_history_patch_path(value, "a/")?;
+            has_old_path = true;
+        } else if !has_new_path && let Some(value) = line.strip_prefix("+++ ") {
+            anyhow::ensure!(has_old_path, "line history patch is missing its old path");
+            entry.new_path = parse_line_history_patch_path(value, "b/")?;
+            has_new_path = true;
+        } else if line.starts_with("@@ ") {
+            anyhow::ensure!(
+                has_old_path && has_new_path,
+                "line history hunk is missing its file path"
+            );
+            let mut fields = line.split_ascii_whitespace();
+            anyhow::ensure!(
+                fields.next() == Some("@@"),
+                "invalid line history hunk header"
+            );
+            let (old_start, old_count) = parse_line_history_hunk_range(fields.next(), '-')?;
+            let (new_start, new_count) = parse_line_history_hunk_range(fields.next(), '+')?;
+            anyhow::ensure!(
+                fields.next() == Some("@@"),
+                "invalid line history hunk terminator"
+            );
+            anyhow::ensure!(
+                old_count == 0 || old_start > 0,
+                "invalid line history old line number"
+            );
+            let start = if new_count == 0 {
+                new_start
+            } else {
+                new_start
+                    .checked_sub(1)
+                    .context("invalid line history new line number")?
+            };
+            let end = start
+                .checked_add(new_count)
+                .context("line history range overflow")?;
+            entry.ranges.push(start..end);
+            remaining = (old_count, new_count);
+        }
+    }
+    anyhow::ensure!(remaining == (0, 0), "incomplete line history hunk");
+    if let Some(entry) = entry {
+        finish_line_history_diff_entry(entry, require_index, has_index, &mut files)?;
+    }
+    anyhow::ensure!(!files.is_empty(), "line history patch has no textual hunks");
+    Ok(files)
+}
+
+fn finish_line_history_diff_entry(
+    mut entry: LineHistoryDiffEntry,
+    require_index: bool,
+    has_index: bool,
+    files: &mut Vec<LineHistoryDiffEntry>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !entry.ranges.is_empty(),
+        "line history patch has no textual hunks"
+    );
+    anyhow::ensure!(
+        !require_index || has_index,
+        "line history patch is missing its full blob index"
+    );
+    anyhow::ensure!(
+        entry.old_path.is_some() || entry.new_path.is_some(),
+        "line history patch has no file path"
+    );
+    if entry.old_path.is_none() {
+        entry.old_oid = None;
+    }
+    if entry.new_path.is_none() {
+        entry.new_oid = None;
+    }
+    anyhow::ensure!(
+        !require_index || entry.old_oid.is_some() || entry.new_oid.is_some(),
+        "line history patch has no blob contents"
+    );
+    files.push(entry);
+    Ok(())
+}
+
+fn parse_line_history_blob_oid(value: &str, require_full_oid: bool) -> Result<Option<Oid>> {
+    anyhow::ensure!(
+        !require_full_oid || matches!(value.len(), SHA1_HEX_LENGTH | SHA256_HEX_LENGTH),
+        "line history patch requires complete blob OIDs"
+    );
+    let oid: Oid = value.parse().context("invalid line history blob OID")?;
+    Ok((!oid.is_zero()).then_some(oid))
+}
+
+fn parse_line_history_hunk_range(value: Option<&str>, prefix: char) -> Result<(u32, u32)> {
+    let value = value
+        .and_then(|value| value.strip_prefix(prefix))
+        .context("invalid line history hunk range")?;
+    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
+    Ok((start.parse()?, count.parse()?))
+}
+
+fn parse_line_history_patch_path(value: &str, prefix: &str) -> Result<Option<RepoPath>> {
+    let decoded = if let Some(quoted) = value.strip_prefix('"') {
+        let mut decoded = Vec::new();
+        let mut bytes = quoted.bytes().peekable();
+        loop {
+            match bytes.next().context("unterminated quoted git path")? {
+                b'"' => {
+                    anyhow::ensure!(
+                        bytes.all(|byte| byte == b'\t'),
+                        "unexpected suffix after quoted git path"
+                    );
+                    break;
+                }
+                b'\\' => {
+                    let escaped = bytes.next().context("incomplete git path escape")?;
+                    let byte = match escaped {
+                        b'a' => 7,
+                        b'b' => 8,
+                        b't' => b'\t',
+                        b'n' => b'\n',
+                        b'v' => 11,
+                        b'f' => 12,
+                        b'r' => b'\r',
+                        b'\\' | b'"' => escaped,
+                        b'0'..=b'7' => {
+                            let mut value = u16::from(escaped - b'0');
+                            for _ in 0..2 {
+                                if let Some(next @ b'0'..=b'7') = bytes.peek().copied() {
+                                    bytes.next();
+                                    value = value * 8 + u16::from(next - b'0');
+                                } else {
+                                    break;
+                                }
+                            }
+                            value.try_into().context("git path octal escape overflow")?
+                        }
+                        _ => bail!("invalid git path escape"),
+                    };
+                    decoded.push(byte);
+                }
+                byte => decoded.push(byte),
+            }
+        }
+        String::from_utf8(decoded).context("git path is not UTF-8")?
+    } else {
+        value.strip_suffix('\t').unwrap_or(value).to_owned()
+    };
+    if decoded == "/dev/null" {
+        return Ok(None);
+    }
+    anyhow::ensure!(!decoded.contains('\0'), "git path contains NUL");
+    let path = decoded
+        .strip_prefix(prefix)
+        .context("unexpected git patch path prefix")?;
+    Ok(Some(RepoPath::from_proto(path)?))
 }
 
 fn parse_line_history_patches(output: &[u8]) -> Result<HashMap<Oid, String>> {
@@ -5655,6 +5897,213 @@ mod tests {
             1,
             "Path states the separator itself and must not gain a second one"
         );
+    }
+
+    #[test]
+    fn test_line_history_diff_parses_full_blob_ids_and_paths() {
+        let old_oid = "0123456789abcdef0123456789abcdef01234567";
+        let new_oid = "89abcdef0123456789abcdef0123456789abcdef";
+        let patch = format!(
+            "diff --git a/old name: file b/new name: file\n\
+             index {old_oid}..{new_oid} 100644\n\
+             --- a/old name: file\t\n+++ b/new name: file\t\n\
+             @@ -2,2 +4,2 @@\n--- source\n+++ source\n context\n"
+        );
+        let files = parse_line_history_diff(&patch).unwrap();
+        let file = files.first().unwrap();
+        assert_eq!(
+            file.old_path,
+            Some(RepoPath::new("old name: file").unwrap())
+        );
+        assert_eq!(
+            file.new_path,
+            Some(RepoPath::new("new name: file").unwrap())
+        );
+        assert_eq!(file.old_oid, Some(old_oid.parse().unwrap()));
+        assert_eq!(file.new_oid, Some(new_oid.parse().unwrap()));
+        assert_eq!(file.ranges, [3..5]);
+    }
+
+    #[test]
+    fn test_line_history_diff_handles_null_blob_sides() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let zero = "0".repeat(40);
+        let patch = format!(
+            "diff --git a/root b/root\nindex {zero}..{oid}\n\
+             --- /dev/null\n+++ b/root\n@@ -0,0 +2,1 @@\n+root line\n\
+             diff --git a/deleted b/deleted\nindex {oid}..{zero}\n\
+             --- a/deleted\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-deleted line\n"
+        );
+        let files = parse_line_history_diff(&patch).unwrap();
+        assert_eq!(files.len(), 2);
+        let root = files.first().unwrap();
+        assert!(root.old_oid.is_none());
+        assert!(root.old_path.is_none());
+        assert_eq!(root.new_oid, Some(oid.parse().unwrap()));
+        assert_eq!(root.ranges, [1..2]);
+        let deleted = files.last().unwrap();
+        assert_eq!(deleted.old_oid, Some(oid.parse().unwrap()));
+        assert!(deleted.new_oid.is_none());
+        assert!(deleted.new_path.is_none());
+        assert_eq!(deleted.ranges, [0..0]);
+    }
+
+    #[test]
+    fn test_line_history_diff_rejects_missing_and_incomplete_blob_ids() {
+        for index in ["", "index abcdef0..abcdef1\n", "index invalid..invalid\n"] {
+            let patch = format!(
+                "diff --git a/file b/file\n{index}--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n"
+            );
+            assert!(parse_line_history_diff(&patch).is_err());
+            if index.is_empty() {
+                assert!(parse_line_history_patch_ranges(&patch).is_ok());
+            }
+        }
+        assert!(parse_line_history_diff("\n\n").is_err());
+    }
+
+    #[test]
+    fn test_line_history_patch_ranges_respect_hunk_counts() {
+        let patch = "diff --git a/old name: file.rs b/new name: file.rs\n\
+                     --- a/old name: file.rs\t\n+++ b/new name: file.rs\t\n\
+                     @@ -3,2 +7,3 @@\n--- old source\n+++ new source\n\
+                     +diff --git a/fake b/fake\n unchanged\n\
+                     @@ -20 +25 @@ function\n-old\n+new\n\
+                     \\ No newline at end of file\n";
+        assert_eq!(
+            parse_line_history_patch_ranges(patch).unwrap(),
+            HashMap::from_iter([(
+                RepoPath::new("new name: file.rs").unwrap(),
+                vec![6..9, 24..25]
+            )])
+        );
+    }
+
+    #[test]
+    fn test_line_history_patch_ranges_root_and_deletions() {
+        let patch = "diff --git a/root b/root\n--- /dev/null\n+++ b/root\n\
+                     @@ -0,0 +5,1 @@\n+root line\n\
+                     diff --git a/deleted b/deleted\n--- a/deleted\n+++ /dev/null\n\
+                     @@ -1,1 +0,0 @@\n-deleted line\n\
+                     diff --git a/partial b/partial\n--- a/partial\n+++ b/partial\n\
+                     @@ -4,1 +3,0 @@\n-deleted middle line\n";
+        assert_eq!(
+            parse_line_history_patch_ranges(patch).unwrap(),
+            HashMap::from_iter([
+                (RepoPath::new("root").unwrap(), vec![4..5]),
+                (RepoPath::new("deleted").unwrap(), vec![0..0]),
+                (RepoPath::new("partial").unwrap(), vec![3..3]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_line_history_patch_ranges_reject_invalid_headers_and_counts() {
+        for patch in [
+            "diff --git a/file b/file\n@@ -1 +1 @@\n-old\n+new\n",
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1,0 @@\n+new\n",
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n",
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +0 @@\n-old\n+new\n",
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +4294967295,2 @@\n-old\n+new\n+new\n",
+            "diff --git a/file b/file\n--- a/file\n+++ b/../file\n@@ -1 +1 @@\n-old\n+new\n",
+        ] {
+            assert!(parse_line_history_patch_ranges(patch).is_err(), "{patch:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_line_history_patch_ranges_real_paths_and_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        for quote_path in [true, false] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let directory = repo_dir.path();
+            git_init_repo(directory);
+            git_command(
+                directory,
+                [
+                    "config",
+                    "core.quotePath",
+                    if quote_path { "true" } else { "false" },
+                ],
+            );
+            let old_path = "旧 name: \"quote\"\t\\file.rs";
+            let new_path = "新 name: target.rs";
+            let original = (1..=30)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>();
+            fs::write(directory.join(old_path), &original).unwrap();
+            fs::write(directory.join("unrelated.rs"), "unrelated original\n").unwrap();
+            git_command(directory, ["add", "."]);
+            git_command(directory, ["commit", "-m", "root with two files"]);
+            let root: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+                .parse()
+                .unwrap();
+            let changed_text = original
+                .replace("line 5\n", "tracked edit\n")
+                .replace("line 25\n", "distant edit\n");
+            fs::write(directory.join(old_path), &changed_text).unwrap();
+            fs::write(directory.join("unrelated.rs"), "unrelated changed\n").unwrap();
+            git_command(directory, ["commit", "-am", "tracked and unrelated edits"]);
+            let changed: Oid = git_command_output(directory, ["rev-parse", "HEAD"])
+                .parse()
+                .unwrap();
+            git_command(directory, ["mv", old_path, new_path]);
+            git_command(directory, ["commit", "-m", "rename"]);
+            let revision = git_command_output(directory, ["rev-parse", "HEAD"])
+                .parse()
+                .unwrap();
+            let repository = RealGitRepository::new(
+                &directory.join(".git"),
+                None,
+                Some("git".into()),
+                cx.executor(),
+            )
+            .unwrap();
+            let patches = repository
+                .line_history_patches(LineHistoryTarget {
+                    path: RepoPath::new(new_path).unwrap(),
+                    revision,
+                    line: 5,
+                })
+                .await
+                .unwrap();
+            assert_eq!(patches.len(), 2);
+            for sha in [root, changed] {
+                let patch = patches.get(&sha).unwrap();
+                let ranges = parse_line_history_patch_ranges(patch).unwrap();
+                assert_eq!(
+                    ranges,
+                    HashMap::from_iter([(RepoPath::new(old_path).unwrap(), vec![4..5])])
+                );
+                let diff = repository
+                    .load_commit(sha.to_string(), false, cx.to_async())
+                    .await
+                    .unwrap();
+                assert_eq!(diff.files.len(), 2);
+                let tracked = diff
+                    .files
+                    .into_iter()
+                    .find(|file| ranges.contains_key(&file.path))
+                    .unwrap();
+                assert_eq!(
+                    tracked.new_content.as_deref(),
+                    Some(if sha == root {
+                        original.as_bytes()
+                    } else {
+                        changed_text.as_bytes()
+                    })
+                );
+                if sha == root {
+                    assert!(tracked.old_content.is_none());
+                } else {
+                    assert_eq!(tracked.old_content.as_deref(), Some(original.as_bytes()));
+                    assert!(!patch.contains("distant edit"));
+                    assert!(changed_text.contains("distant edit"));
+                }
+            }
+        }
     }
 
     #[test]

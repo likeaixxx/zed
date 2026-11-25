@@ -43,6 +43,7 @@ use git::{
         GitCommitTemplate, GitRepository, InitialGraphCommitData, LineHistoryTarget, LogOrder,
         LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
         UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        parse_line_history_diff,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -397,6 +398,85 @@ pub struct CommitFile {
     pub old_text: Option<String>,
     pub new_text: Option<String>,
     pub is_binary: bool,
+}
+
+#[derive(Debug)]
+pub struct LineHistoryDiffFile {
+    pub file: CommitFile,
+    /// Zero-based line ranges in the selected commit; empty ranges mark deletion positions.
+    pub ranges: Vec<Range<u32>>,
+}
+
+async fn load_line_history_diff(
+    backend: &dyn GitRepository,
+    sha: Oid,
+    patch: &str,
+) -> Result<Vec<LineHistoryDiffFile>> {
+    let entries = parse_line_history_diff(patch)
+        .with_context(|| format!("cannot parse line history diff for commit {sha}"))?;
+    let revisions = entries
+        .iter()
+        .flat_map(|entry| [entry.old_oid, entry.new_oid])
+        .flatten()
+        .map(|oid| oid.to_string())
+        .collect::<Vec<_>>();
+    let revision_count = revisions.len();
+    let contents = backend
+        .load_revisions(revisions)
+        .await
+        .with_context(|| format!("cannot load line history blobs for commit {sha}"))?;
+    anyhow::ensure!(
+        contents.len() == revision_count,
+        "unexpected number of line history blobs for commit {sha}"
+    );
+    let mut contents = contents.into_iter();
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let path = entry
+            .new_path
+            .or(entry.old_path)
+            .context("line history patch has no file path")?;
+        let mut load_text = |oid: Option<Oid>| -> Result<Option<String>> {
+            let Some(oid) = oid else {
+                return Ok(None);
+            };
+            let content = contents.next().flatten().with_context(|| {
+                format!(
+                    "line history blob {oid} for {} at commit {sha} is missing or is not a blob",
+                    path.as_unix_str()
+                )
+            })?;
+            // A textual Git -L hunk can deliberately contain NULs. Preserve valid UTF-8
+            // before encoding detection can mistake that content for UTF-16.
+            let decoded = match String::from_utf8(content) {
+                Ok(text) => Ok(text
+                    .strip_prefix('\u{feff}')
+                    .map(str::to_owned)
+                    .unwrap_or(text)),
+                Err(error) => decode_git_text(error.into_bytes()),
+            };
+            decoded
+                .with_context(|| {
+                    format!(
+                        "cannot decode line history blob {oid} for {} at commit {sha}",
+                        path.as_unix_str()
+                    )
+                })
+                .map(Some)
+        };
+        let old_text = load_text(entry.old_oid)?;
+        let new_text = load_text(entry.new_oid)?;
+        files.push(LineHistoryDiffFile {
+            file: CommitFile {
+                path,
+                old_text,
+                new_text,
+                is_binary: false,
+            },
+            ranges: entry.ranges,
+        });
+    }
+    Ok(files)
 }
 
 impl CommitFile {
@@ -7458,6 +7538,27 @@ impl Repository {
         })
     }
 
+    pub fn line_history_diff(
+        &mut self,
+        sha: Oid,
+        patch: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<LineHistoryDiffFile>>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = object_read_limiter.acquire_arc().await;
+            match repository_state.await.map_err(|error| anyhow!(error))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    load_line_history_diff(backend.as_ref(), sha, &patch).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("line history diff is not supported for remote repositories")
+                }
+            }
+        })
+    }
+
     pub fn line_history_patches(
         &self,
         target: LineHistoryTarget,
@@ -11690,6 +11791,313 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn line_history_git(directory: &Path, arguments: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end_matches('\n')
+            .to_owned()
+    }
+
+    fn real_line_history_repository(
+        cx: &TestAppContext,
+    ) -> (tempfile::TempDir, git::repository::RealGitRepository) {
+        let directory = tempfile::tempdir().unwrap();
+        line_history_git(directory.path(), &["init", "-b", "main"]);
+        let repository = git::repository::RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        (directory, repository)
+    }
+
+    #[gpui::test]
+    async fn test_line_history_diff_loads_rename_blobs_and_root(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let (directory, backend) = real_line_history_repository(cx);
+        let directory = directory.path();
+        let old_path = "旧 name: tracked.txt";
+        let new_path = "新 name: tracked.txt";
+        let original = (1..=30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(directory.join(old_path), &original).unwrap();
+        std::fs::write(directory.join("unrelated"), "unrelated original\n").unwrap();
+        line_history_git(directory, &["add", "."]);
+        line_history_git(directory, &["commit", "-m", "root"]);
+        let root: Oid = line_history_git(directory, &["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        line_history_git(directory, &["mv", old_path, new_path]);
+        let changed = original
+            .replace("line 2\n", "tracked edit\n")
+            .replace("line 25\n", "distant edit\n");
+        std::fs::write(directory.join(new_path), &changed).unwrap();
+        std::fs::write(directory.join("unrelated"), "unrelated changed\n").unwrap();
+        line_history_git(directory, &["commit", "-am", "rename and edit"]);
+        let revision = line_history_git(directory, &["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let patches = backend
+            .line_history_patches(LineHistoryTarget {
+                path: repo_path(new_path),
+                revision,
+                line: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(patches.len(), 2);
+        let patch = patches.get(&revision).unwrap();
+        assert!(!patch.contains("distant edit"));
+        assert!(!patch.contains("unrelated"));
+        let entries = parse_line_history_diff(patch).unwrap();
+        let entry = entries.first().unwrap();
+        assert_eq!(entry.old_path, Some(repo_path(old_path)));
+        assert_eq!(entry.new_path, Some(repo_path(new_path)));
+        assert_eq!(
+            entry.old_oid.unwrap().to_string(),
+            line_history_git(directory, &["rev-parse", &format!("{root}:{old_path}")])
+        );
+        assert_eq!(
+            entry.new_oid.unwrap().to_string(),
+            line_history_git(directory, &["rev-parse", &format!("{revision}:{new_path}")])
+        );
+
+        let (_fs, _project, repository) = setup_repository(cx, &[]).await;
+        let state = repository
+            .read_with(cx, |repository, _| repository.repository_state.clone())
+            .await
+            .unwrap();
+        let RepositoryState::Local(mut state) = state else {
+            panic!("expected local repository")
+        };
+        state.backend = Arc::new(backend);
+        repository.update(cx, |repository, _| {
+            repository.repository_state = Task::ready(Ok(RepositoryState::Local(state))).shared();
+        });
+        for (sha, path, old_text, new_text) in [
+            (
+                revision,
+                new_path,
+                Some(original.as_str()),
+                changed.as_str(),
+            ),
+            (root, old_path, None, original.as_str()),
+        ] {
+            let files = repository
+                .update(cx, |repository, cx| {
+                    repository.line_history_diff(sha, patches.get(&sha).unwrap().clone(), cx)
+                })
+                .await
+                .unwrap();
+            assert_eq!(files.len(), 1);
+            let file = files.first().unwrap();
+            assert_eq!(file.file.path, repo_path(path));
+            assert_eq!(file.file.old_text.as_deref(), old_text);
+            assert_eq!(file.file.new_text.as_deref(), Some(new_text));
+            assert_eq!(file.ranges, [1..2]);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_line_history_diff_decodes_legacy_and_reports_bad_blobs(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (directory, backend) = real_line_history_repository(cx);
+        let directory = directory.path();
+        let original = "before\nLe café coûte déjà 10 € : “voilà l'été français”.\nafter\n";
+        std::fs::write(
+            directory.join("file"),
+            encode_text(original.to_owned(), encoding_rs::WINDOWS_1252, false),
+        )
+        .unwrap();
+        line_history_git(directory, &["add", "."]);
+        line_history_git(directory, &["commit", "-m", "legacy root"]);
+        let root = line_history_git(directory, &["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let changed = "before\ncurrent readable text\nafter\n";
+        std::fs::write(directory.join("file"), changed).unwrap();
+        line_history_git(directory, &["commit", "-am", "UTF-8 current"]);
+        let revision = line_history_git(directory, &["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let patches = backend
+            .line_history_patches(LineHistoryTarget {
+                path: repo_path("file"),
+                revision,
+                line: 2,
+            })
+            .await
+            .unwrap();
+        let files = load_line_history_diff(&backend, revision, patches.get(&revision).unwrap())
+            .await
+            .unwrap();
+        let file = files.first().unwrap();
+        assert_eq!(file.file.old_text.as_deref(), Some(original));
+        assert_eq!(file.file.new_text.as_deref(), Some(changed));
+        let root_patch = patches.get(&root).unwrap();
+        let files = load_line_history_diff(&backend, root, root_patch)
+            .await
+            .unwrap();
+        assert!(files.first().unwrap().file.old_text.is_none());
+        assert_eq!(
+            files.first().unwrap().file.new_text.as_deref(),
+            Some(original)
+        );
+        let root_oid = parse_line_history_diff(root_patch)
+            .unwrap()
+            .first()
+            .unwrap()
+            .new_oid
+            .unwrap();
+        let missing = root_patch.replace(&root_oid.to_string(), &"f".repeat(40));
+        let error = load_line_history_diff(&backend, root, &missing)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("missing or is not a blob"));
+
+        std::fs::write(directory.join(".gitattributes"), "file diff\n").unwrap();
+        std::fs::write(directory.join("file"), b"before\ntracked\0history\nafter\n").unwrap();
+        line_history_git(directory, &["add", "."]);
+        line_history_git(
+            directory,
+            &["commit", "-m", "binary history forced to text diff"],
+        );
+        std::fs::write(directory.join("file"), changed).unwrap();
+        line_history_git(directory, &["commit", "-am", "readable again"]);
+        let revision = line_history_git(directory, &["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        let patches = backend
+            .line_history_patches(LineHistoryTarget {
+                path: repo_path("file"),
+                revision,
+                line: 2,
+            })
+            .await
+            .unwrap();
+        let files = load_line_history_diff(&backend, revision, patches.get(&revision).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            files.first().unwrap().file.old_text.as_deref(),
+            Some("before\ntracked\0history\nafter\n")
+        );
+        assert_eq!(
+            files.first().unwrap().file.new_text.as_deref(),
+            Some(changed)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_line_history_diff_merge_uses_patch_blobs_without_parent_fallback(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (directory, backend) = real_line_history_repository(cx);
+        let directory = directory.path();
+        std::fs::write(directory.join("file"), "before\noriginal\nafter\n").unwrap();
+        line_history_git(directory, &["add", "."]);
+        line_history_git(directory, &["commit", "-m", "root"]);
+        line_history_git(directory, &["branch", "side"]);
+        let main_text = "before\nmain value\nafter\n";
+        std::fs::write(directory.join("file"), main_text).unwrap();
+        line_history_git(directory, &["commit", "-am", "main change"]);
+        let main_sha = line_history_git(directory, &["rev-parse", "HEAD"]);
+        line_history_git(directory, &["checkout", "side"]);
+        let side_text = "before\nside value\nafter\n";
+        std::fs::write(directory.join("file"), side_text).unwrap();
+        line_history_git(directory, &["commit", "-am", "side change"]);
+        let side_sha = line_history_git(directory, &["rev-parse", "HEAD"]);
+        line_history_git(directory, &["checkout", "main"]);
+        std::fs::write(directory.join("file"), "before\nresolved value\nafter\n").unwrap();
+        line_history_git(directory, &["add", "."]);
+        let tree = line_history_git(directory, &["write-tree"]);
+        let merge_sha = line_history_git(
+            directory,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &main_sha,
+                "-p",
+                &side_sha,
+                "-m",
+                "merge resolved",
+            ],
+        );
+        let revision = merge_sha.parse().unwrap();
+        let patches = backend
+            .line_history_patches(LineHistoryTarget {
+                path: repo_path("file"),
+                revision,
+                line: 2,
+            })
+            .await
+            .unwrap();
+        for (sha, new_text) in [(main_sha, main_text), (side_sha, side_text)] {
+            let sha = sha.parse().unwrap();
+            let files = load_line_history_diff(&backend, sha, patches.get(&sha).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                files.first().unwrap().file.old_text.as_deref(),
+                Some("before\noriginal\nafter\n")
+            );
+            assert_eq!(
+                files.first().unwrap().file.new_text.as_deref(),
+                Some(new_text)
+            );
+        }
+        let merge_patch = patches.get(&revision).unwrap();
+        if merge_patch.trim().is_empty() {
+            assert!(
+                load_line_history_diff(&backend, revision, merge_patch)
+                    .await
+                    .is_err()
+            );
+        } else {
+            let entries = parse_line_history_diff(merge_patch).unwrap();
+            let files = load_line_history_diff(&backend, revision, merge_patch)
+                .await
+                .unwrap();
+            for (entry, file) in entries.into_iter().zip(files) {
+                let old_blob = backend
+                    .load_revisions(vec![entry.old_oid.unwrap().to_string()])
+                    .await
+                    .unwrap()
+                    .pop()
+                    .flatten()
+                    .unwrap();
+                assert_eq!(file.file.old_text, Some(decode_git_text(old_blob).unwrap()));
+                assert_eq!(
+                    file.file.new_text.as_deref(),
+                    Some("before\nresolved value\nafter\n")
+                );
+            }
+        }
     }
 
     #[gpui::test]
