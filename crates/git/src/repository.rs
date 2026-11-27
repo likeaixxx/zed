@@ -3420,6 +3420,9 @@ impl GitRepository for RealGitRepository {
 
                 args.push("--grep");
                 args.push(search_args.query.as_str());
+
+                args.push("--author");
+                args.push(search_args.query.as_str());
             }
 
             args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
